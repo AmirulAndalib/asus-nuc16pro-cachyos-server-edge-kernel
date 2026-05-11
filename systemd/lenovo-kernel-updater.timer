@@ -1,10 +1,11 @@
 [Unit]
-Description=Check GitHub Releases for Lenovo kernel every Thursday at 00:30 local time
+Description=Check GitHub Releases for Lenovo CachyOS kernel daily at 4 AM
 
 [Timer]
-OnCalendar=Thu 00:30:00
+OnCalendar=*-*-* 04:00:00
 Persistent=true
 RandomizedDelaySec=0
 
 [Install]
 WantedBy=timers.target
+

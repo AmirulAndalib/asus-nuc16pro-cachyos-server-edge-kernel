@@ -1,5 +1,5 @@
 [Unit]
-Description=Install latest Lenovo V15 G2 ITL kernel from GitHub Releases
+Description=Install latest Lenovo V15 G2 ITL CachyOS edge kernel from GitHub Releases
 After=network-online.target
 Wants=network-online.target
 
@@ -7,3 +7,6 @@ Wants=network-online.target
 Type=oneshot
 Environment=OWNER_REPO=AmirulAndalib/lenovo-v15g2-itl-cachyos-server-edge-kernel
 ExecStart=/usr/local/sbin/lenovo-kernel-updater.sh
+
+[Install]
+WantedBy=multi-user.target

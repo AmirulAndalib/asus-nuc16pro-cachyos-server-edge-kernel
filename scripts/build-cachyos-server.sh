@@ -9,10 +9,9 @@ BUILD="/work/build"
 DIST="/work/dist"
 CACHY_PKG="$BUILD/cachy-pkg"
 
-# Options:
-#   linux-cachyos-rc      = bleeding-edge RC/mainline
-#   linux-cachyos-server  = server variant, usually stable/latest non-RC
-CACHY_VARIANT="${CACHY_VARIANT:-linux-cachyos-rc}"
+# linux-cachyos-server = stable server variant with server-optimized base config (default)
+# linux-cachyos-rc     = bleeding-edge RC/mainline (override via CACHY_VARIANT env)
+CACHY_VARIANT="${CACHY_VARIANT:-linux-cachyos-server}"
 
 echo "========== CONTAINER INFO =========="
 date
@@ -23,23 +22,23 @@ df -h
 free -h
 
 echo "========== TOOLCHAIN INFO =========="
-clang --version || true
-ld.lld --version || true
+clang --version       || true
+ld.lld --version      || true
 x86_64-linux-gnu-gcc --version | head -2 || true
-ccache --version || true
+pahole --version      || true
+ccache --version      || true
 make --version | head -2 || true
 
 echo "========== CCACHE SETUP =========="
 export CCACHE_DIR="${CCACHE_DIR:-/ccache}"
-export CCACHE_MAXSIZE="${CCACHE_MAXSIZE:-20G}"
+export CCACHE_MAXSIZE="${CCACHE_MAXSIZE:-30G}"
 export CCACHE_COMPILERCHECK=content
 ccache --zero-stats || true
-ccache -s || true
+ccache -s           || true
 
 echo "========== FETCH CACHYOS PKGBUILD + CONFIG =========="
 rm -rf "$BUILD"
 mkdir -p "$CACHY_PKG"
-
 git clone --depth=1 https://github.com/CachyOS/linux-cachyos.git "$CACHY_PKG"
 
 CACHY_COMMIT="$(git -C "$CACHY_PKG" rev-parse --short HEAD)"
@@ -53,28 +52,28 @@ if [ ! -d "$PKGBUILD_DIR" ]; then
 fi
 
 echo "linux-cachyos commit: $CACHY_COMMIT"
-echo "Using variant: $CACHY_VARIANT"
+echo "Using variant:        $CACHY_VARIANT"
 
 echo "========== PARSE PKGBUILD =========="
-
+# Source PKGBUILD in an isolated subshell so bash expands pkgver=${_major}.${_minor}
+# and similar composed variables. Lifecycle functions are stubbed.
 _pkgbuild_subshell() {
   bash -c "
     cd '$PKGBUILD_DIR'
     prepare() { true; }
-    build() { true; }
+    build()   { true; }
     package() { true; }
     source PKGBUILD 2>/dev/null || true
     $1
   " 2>/dev/null
 }
 
-KVER="$(_pkgbuild_subshell 'printf "%s" "${pkgver:-}"' | tr -d $'\n')"
-PKGREL="$(_pkgbuild_subshell 'printf "%s" "${pkgrel:-1}"' | tr -d $'\n')"
+KVER="$(   _pkgbuild_subshell 'printf "%s" "${pkgver:-}"' | tr -d $'\n')"
+PKGREL="$( _pkgbuild_subshell 'printf "%s" "${pkgrel:-1}"' | tr -d $'\n')"
 PKGREL="${PKGREL:-1}"
 
 if [ -z "${KVER:-}" ]; then
-  echo "ERROR: pkgver could not be expanded — check PKGBUILD"
-  echo "--- PKGBUILD head ---"
+  echo "ERROR: pkgver could not be expanded - check PKGBUILD"
   head -50 "$PKGBUILD_DIR/PKGBUILD"
   exit 1
 fi
@@ -100,30 +99,24 @@ TARBALL_URL="$(
 )"
 
 if [ -z "${TARBALL_URL:-}" ]; then
-  echo "ERROR: no tarball URL found in PKGBUILD source array"
-  echo "--- PKGBUILD source items ---"
+  echo "ERROR: no tarball URL in PKGBUILD source array"
   printf '%s\n' "${SOURCE_ITEMS[@]}"
   exit 1
 fi
 
 echo "Tarball URL: $TARBALL_URL"
-echo "Extra patch URLs (${#PATCH_URLS[@]}):"
+echo "Patch URLs (${#PATCH_URLS[@]}):"
 printf '  %s\n' "${PATCH_URLS[@]+"${PATCH_URLS[@]}"}"
 
 echo "========== DOWNLOAD KERNEL =========="
 cd "$BUILD"
-
 TARBALL_FILE="$(basename "$TARBALL_URL" | sed 's/[?#].*//')"
 wget -q --show-progress -O "$TARBALL_FILE" "$TARBALL_URL"
-
 echo "Extracting $TARBALL_FILE ..."
 tar -xf "$TARBALL_FILE"
 rm -f "$TARBALL_FILE"
 
-echo "========== DETECT EXTRACTED SOURCE TREE =========="
-echo "Build directory after extraction:"
-find "$BUILD" -maxdepth 2 -type d | sort
-
+echo "========== DETECT KERNEL SOURCE TREE =========="
 LINUX_SRC="$(
   find "$BUILD" -mindepth 1 -maxdepth 2 -type f -name Makefile \
     ! -path "$CACHY_PKG/*" \
@@ -138,11 +131,7 @@ LINUX_SRC="$(
 
 if [ -z "${LINUX_SRC:-}" ]; then
   echo "ERROR: kernel source directory not found after extraction"
-  echo "--- BUILD LISTING ---"
   ls -la "$BUILD"
-  echo "--- CANDIDATE MAKEFILES ---"
-  find "$BUILD" -maxdepth 4 -type f -name Makefile -print
-  echo "--- CANDIDATE scripts/config ---"
   find "$BUILD" -maxdepth 5 -type f -path '*/scripts/config' -print
   exit 1
 fi
@@ -150,30 +139,23 @@ fi
 echo "Source tree: $LINUX_SRC"
 cd "$LINUX_SRC"
 
-echo "========== APPLY EXTRA CACHYOS PATCH URLS =========="
+echo "========== APPLY CACHYOS PATCHES =========="
 PATCH_FAIL=0
-
 if [ "${#PATCH_URLS[@]}" -eq 0 ]; then
-  echo "No extra patch URLs found."
+  echo "No patch URLs found in PKGBUILD."
 else
   for url in "${PATCH_URLS[@]}"; do
     name="$(basename "$url" | sed 's/[?#].*//')"
     echo "  -> $name"
-
     if ! curl -fsSL -o "/tmp/${name}" "$url"; then
-      echo "WARN: download failed: $url"
-      PATCH_FAIL=1
-      continue
+      echo "WARN: download failed: $url"; PATCH_FAIL=1; continue
     fi
-
     if ! patch -p1 --forward --fuzz=3 -r /dev/null < "/tmp/${name}"; then
-      echo "WARN: patch failed or already applied: $name"
-      PATCH_FAIL=1
+      echo "WARN: patch failed or already applied: $name"; PATCH_FAIL=1
     fi
   done
 fi
-
-[ "$PATCH_FAIL" -ne 0 ] && echo "WARN: one or more extra patches failed or were already applied; continuing."
+[ "$PATCH_FAIL" -ne 0 ] && echo "WARN: partial patchset - continuing."
 
 echo "========== SETUP BASE CONFIG =========="
 if [ ! -f "$PKGBUILD_DIR/config" ]; then
@@ -181,111 +163,206 @@ if [ ! -f "$PKGBUILD_DIR/config" ]; then
   find "$PKGBUILD_DIR" -maxdepth 2 -type f | sort
   exit 1
 fi
-
 cp "$PKGBUILD_DIR/config" .config
 chmod +x ./scripts/config
 
-echo "========== APPLY SERVER / TIGER LAKE TWEAKS =========="
+echo "========== APPLY LENOVO V15 G2 ITL SERVERMAX TWEAKS =========="
 
-./scripts/config --set-str LOCALVERSION "-cachyos-edge-lenovov15g2"
+# LOCALVERSION must be set via scripts/config (string, not boolean)
+./scripts/config --set-str LOCALVERSION "-cachyos-edge-lenovov15g2-servermax"
 
-# CPU target: x86-64-v3 where Cachy/Graysky symbols exist.
-./scripts/config --disable GENERIC_CPU    || true
-./scripts/config --disable GENERIC_CPU2   || true
-./scripts/config --disable GENERIC_CPU4   || true
-./scripts/config --enable  GENERIC_CPU3   || true
+# Use a config fragment + merge_config.sh for everything else.
+# scripts/config writes raw .config but does NOT understand Kconfig choice
+# semantics correctly - olddefconfig can revert choice transitions.
+# merge_config.sh is the kernel's official fragment merger - it processes
+# the fragment through Kconfig and resolves choice blocks properly.
 
-# Timer frequency: 100 Hz server profile.
-./scripts/config --disable HZ_250   || true
-./scripts/config --disable HZ_300   || true
-./scripts/config --disable HZ_500   || true
-./scripts/config --disable HZ_600   || true
-./scripts/config --disable HZ_750   || true
-./scripts/config --disable HZ_1000  || true
-./scripts/config --enable  HZ_100
-./scripts/config --set-val HZ 100
+cat > /tmp/servermax.config << 'FRAGMENT'
+# ---- Timer frequency: 100 Hz (lowest overhead server) ----
+CONFIG_HZ_100=y
+CONFIG_HZ=100
+# CONFIG_HZ_250 is not set
+# CONFIG_HZ_300 is not set
+# CONFIG_HZ_500 is not set
+# CONFIG_HZ_600 is not set
+# CONFIG_HZ_750 is not set
+# CONFIG_HZ_1000 is not set
 
-# Preemption: best-effort no-preempt/server throughput.
-./scripts/config --disable PREEMPT_VOLUNTARY_BUILD || true
-./scripts/config --disable PREEMPT_BUILD           || true
-./scripts/config --disable PREEMPT_DYNAMIC         || true
-./scripts/config --disable PREEMPT_LAZY            || true
-./scripts/config --disable PREEMPT                 || true
-./scripts/config --enable  PREEMPT_NONE_BUILD      || true
+# ---- LTO: ThinLTO ----
+CONFIG_LTO=y
+CONFIG_LTO_CLANG=y
+CONFIG_LTO_CLANG_THIN=y
+# CONFIG_LTO_NONE is not set
+# CONFIG_LTO_CLANG_FULL is not set
 
-# LTO: ThinLTO.
-./scripts/config --enable  LTO              || true
-./scripts/config --enable  LTO_CLANG        || true
-./scripts/config --disable LTO_NONE         || true
-./scripts/config --disable LTO_CLANG_FULL   || true
-./scripts/config --enable  LTO_CLANG_THIN   || true
+# ---- Transparent Huge Pages: always ----
+CONFIG_TRANSPARENT_HUGEPAGE=y
+CONFIG_TRANSPARENT_HUGEPAGE_ALWAYS=y
+# CONFIG_TRANSPARENT_HUGEPAGE_MADVISE is not set
+# CONFIG_TRANSPARENT_HUGEPAGE_NEVER is not set
 
-# Transparent Huge Pages: always.
-./scripts/config --enable  TRANSPARENT_HUGEPAGE
-./scripts/config --disable TRANSPARENT_HUGEPAGE_MADVISE || true
-./scripts/config --disable TRANSPARENT_HUGEPAGE_NEVER   || true
-./scripts/config --enable  TRANSPARENT_HUGEPAGE_ALWAYS
+# ---- IKCONFIG: expose running config via /proc/config.gz ----
+CONFIG_IKCONFIG=y
+CONFIG_IKCONFIG_PROC=y
 
-# Expose config via /proc/config.gz.
-./scripts/config --enable IKCONFIG
-./scripts/config --enable IKCONFIG_PROC
+# ---- BPF + sched_ext (requires DWARF debug info for BTF generation) ----
+# CRITICAL: DEBUG_INFO_BTF requires DWARF. Disabling DWARF kills BTF
+# which kills SCHED_CLASS_EXT which kills every scx_* scheduler.
+CONFIG_BPF=y
+CONFIG_BPF_SYSCALL=y
+CONFIG_BPF_JIT=y
+CONFIG_BPF_JIT_ALWAYS_ON=y
+CONFIG_BPF_JIT_DEFAULT_ON=y
+CONFIG_BPF_EVENTS=y
+CONFIG_BPF_LSM=y
+CONFIG_BPF_STREAM_PARSER=y
+CONFIG_DEBUG_INFO=y
+CONFIG_DEBUG_INFO_DWARF_TOOLCHAIN_DEFAULT=y
+CONFIG_DEBUG_INFO_BTF=y
+CONFIG_DEBUG_INFO_BTF_MODULES=y
+CONFIG_SCHED_CLASS_EXT=y
 
-# Intel Tiger Lake iGPU / Quick Sync.
-./scripts/config --module DRM_I915 || ./scripts/config --enable DRM_I915 || true
+# ---- AC-powered: no RCU lazy power-saving bias ----
+# CONFIG_RCU_LAZY is not set
 
-# Intel CPU power management.
-./scripts/config --enable X86_INTEL_PSTATE || true
-./scripts/config --enable INTEL_IDLE || true
-./scripts/config --enable INTEL_HFI_THERMAL || true
+# ---- Network: BBR + FQ + io_uring + TLS + XDP ----
+CONFIG_TCP_CONG_BBR=y
+CONFIG_DEFAULT_TCP_CONG="bbr"
+CONFIG_NET_SCH_FQ=m
+CONFIG_NET_SCH_FQ_CODEL=y
+CONFIG_IO_URING=y
+CONFIG_TLS=m
+CONFIG_TLS_DEVICE=y
+CONFIG_XDP_SOCKETS=y
+CONFIG_XDP_SOCKETS_DIAG=m
 
-# WiFi: Intel AX201.
-./scripts/config --module IWLWIFI || ./scripts/config --enable IWLWIFI || true
-./scripts/config --module IWLMVM  || ./scripts/config --enable IWLMVM  || true
+# ---- Full cgroup v2 stack (Docker / Podman / systemd) ----
+CONFIG_CGROUPS=y
+CONFIG_MEMCG=y
+CONFIG_BLK_CGROUP=y
+CONFIG_CGROUP_SCHED=y
+CONFIG_FAIR_GROUP_SCHED=y
+CONFIG_CFS_BANDWIDTH=y
+CONFIG_RT_GROUP_SCHED=y
+CONFIG_CGROUP_PIDS=y
+CONFIG_CGROUP_RDMA=y
+CONFIG_CGROUP_FREEZER=y
+CONFIG_CGROUP_HUGETLB=y
+CONFIG_CGROUP_DEVICE=y
+CONFIG_CGROUP_CPUACCT=y
+CONFIG_CGROUP_PERF=y
+CONFIG_CGROUP_BPF=y
+CONFIG_CGROUP_MISC=y
+CONFIG_BLK_CGROUP_IOLATENCY=y
+CONFIG_BLK_CGROUP_IOCOST=y
+CONFIG_NETFILTER_XT_MATCH_CGROUP=m
 
-# Sound: Intel SOF / SoundWire, best-effort modules.
-./scripts/config --module SND_SOC_SOF                      || true
-./scripts/config --module SND_SOC_SOF_INTEL_SOUNDWIRE_LINK || true
-./scripts/config --module SND_SOC_SOF_TIGERLAKE            || true
+# ---- Container namespaces ----
+CONFIG_NAMESPACES=y
+CONFIG_NET_NS=y
+CONFIG_PID_NS=y
+CONFIG_IPC_NS=y
+CONFIG_UTS_NS=y
+CONFIG_USER_NS=y
+CONFIG_TIME_NS=y
+CONFIG_CHECKPOINT_RESTORE=y
+CONFIG_USERFAULTFD=y
 
-# Thunderbolt / USB4.
-./scripts/config --module THUNDERBOLT || ./scripts/config --enable THUNDERBOLT || true
-./scripts/config --module USB4        || ./scripts/config --enable USB4        || true
+# ---- Container networking ----
+CONFIG_OVERLAY_FS=m
+CONFIG_VETH=m
+CONFIG_BRIDGE=m
+CONFIG_BRIDGE_NETFILTER=m
+CONFIG_VXLAN=m
+CONFIG_IPVLAN=m
+CONFIG_MACVLAN=m
+CONFIG_NET_IPVTI=m
 
-# Intel PMT telemetry.
-./scripts/config --module INTEL_PMT_TELEMETRY || ./scripts/config --enable INTEL_PMT_TELEMETRY || true
-./scripts/config --module INTEL_PMT_CRASHLOG  || ./scripts/config --enable INTEL_PMT_CRASHLOG  || true
+# ---- Firewall / NAT / nftables ----
+CONFIG_NF_TABLES=m
+CONFIG_NFT_CHAIN_NAT=m
+CONFIG_NFT_MASQ=m
+CONFIG_NFT_REDIR=m
+CONFIG_NF_NAT=m
+CONFIG_IP_NF_NAT=m
+CONFIG_IP_NF_FILTER=m
 
-# Network: BBR + FQ.
-./scripts/config --enable TCP_CONG_BBR || true
-./scripts/config --enable DEFAULT_BBR || true
-./scripts/config --set-str DEFAULT_TCP_CONG "bbr" || true
-./scripts/config --module NET_SCH_FQ || ./scripts/config --enable NET_SCH_FQ || true
+# ---- Server/network filesystems ----
+CONFIG_NFS_FS=m
+CONFIG_NFSD=m
+CONFIG_CIFS=m
+CONFIG_BTRFS_FS=m
+CONFIG_F2FS_FS=m
+CONFIG_XFS_FS=m
+CONFIG_EROFS_FS=m
 
-# Docker/container support.
-./scripts/config --enable NAMESPACES || true
-./scripts/config --enable NET_NS || true
-./scripts/config --enable PID_NS || true
-./scripts/config --enable IPC_NS || true
-./scripts/config --enable UTS_NS || true
-./scripts/config --enable USER_NS || true
-./scripts/config --module OVERLAY_FS || ./scripts/config --enable OVERLAY_FS || true
-./scripts/config --module VETH || ./scripts/config --enable VETH || true
-./scripts/config --module BRIDGE || ./scripts/config --enable BRIDGE || true
-./scripts/config --module BRIDGE_NETFILTER || ./scripts/config --enable BRIDGE_NETFILTER || true
+# ---- Block I/O performance ----
+CONFIG_BLK_WBT=y
+CONFIG_BLK_WBT_MQ=y
+CONFIG_BLK_INLINE_ENCRYPTION=y
+CONFIG_NVME_MULTIPATH=y
+CONFIG_IOSCHED_BFQ=m
+CONFIG_MQ_IOSCHED_DEADLINE=y
+CONFIG_IOSCHED_ADIOS=m
+CONFIG_MQ_IOSCHED_ADIOS=m
 
-# Useful server/filesystem modules.
-./scripts/config --module NF_TABLES || ./scripts/config --enable NF_TABLES || true
-./scripts/config --module IP_NF_NAT || ./scripts/config --enable IP_NF_NAT || true
-./scripts/config --module NFS_FS || true
-./scripts/config --module CIFS || true
-./scripts/config --module SMB_SERVER || true
-./scripts/config --module BTRFS_FS || true
-./scripts/config --module F2FS_FS || true
-./scripts/config --module XFS_FS || true
+# ---- Zswap: zstd (faster than lz4 for most workloads, kernel default) ----
+CONFIG_ZSWAP=y
+CONFIG_ZSWAP_DEFAULT_ON=y
+CONFIG_ZSWAP_SHRINKER_DEFAULT_ON=y
+CONFIG_ZSWAP_COMPRESSOR_DEFAULT_ZSTD=y
+CONFIG_ZSWAP_COMPRESSOR_DEFAULT="zstd"
+CONFIG_CRYPTO_ZSTD=y
+CONFIG_ZSTD_COMPRESS=y
+CONFIG_ZSTD_DECOMPRESS=y
+CONFIG_CRYPTO_LZ4=y
+CONFIG_LZ4_COMPRESS=y
+CONFIG_LZ4_DECOMPRESS=y
+CONFIG_Z3FOLD=y
+CONFIG_ZSMALLOC=y
 
-# Reduce package size.
-./scripts/config --disable DEBUG_INFO_BTF    || true
-./scripts/config --disable DEBUG_INFO_DWARF5 || true
+# ---- Intel Tiger Lake iGPU / Iris Xe / Quick Sync ----
+CONFIG_DRM_I915=m
+CONFIG_DRM_I915_GVT_KVMGT=m
+
+# ---- Intel CPU power management ----
+CONFIG_X86_INTEL_PSTATE=y
+CONFIG_INTEL_IDLE=y
+CONFIG_THERMAL=y
+CONFIG_THERMAL_GOV_POWER_ALLOCATOR=y
+CONFIG_INTEL_HFI_THERMAL=y
+CONFIG_INTEL_RAPL=m
+
+# ---- Wi-Fi: Intel AX201 ----
+CONFIG_IWLWIFI=m
+CONFIG_IWLMVM=m
+
+# ---- Sound: Intel SOF / SoundWire / HDA ----
+CONFIG_SND_SOC_SOF=m
+CONFIG_SND_SOC_SOF_INTEL_SOUNDWIRE_LINK=y
+CONFIG_SND_SOC_SOF_TIGERLAKE=m
+CONFIG_SND_HDA_INTEL=m
+
+# ---- Thunderbolt / USB4 ----
+CONFIG_THUNDERBOLT=m
+CONFIG_USB4=m
+
+# ---- Intel PMT telemetry ----
+CONFIG_INTEL_PMT_TELEMETRY=m
+CONFIG_INTEL_PMT_CRASHLOG=m
+
+# ---- PCIe performance ----
+CONFIG_PCIEASPM=y
+CONFIG_PCIEASPM_PERFORMANCE=y
+CONFIG_PCIE_PTM=y
+
+# ---- Misc performance ----
+CONFIG_SCHED_AUTOGROUP=y
+FRAGMENT
+
+echo "Merging servermax fragment via scripts/kconfig/merge_config.sh ..."
+chmod +x ./scripts/kconfig/merge_config.sh
+./scripts/kconfig/merge_config.sh -m .config /tmp/servermax.config
 
 echo "========== OLDDEFCONFIG =========="
 make ARCH=x86_64 LLVM=1 LLVM_IAS=1 olddefconfig
@@ -294,27 +371,20 @@ echo "========== VERIFY CRITICAL CONFIG OPTIONS =========="
 FAILED=0
 
 _check_eq() {
-  local key="$1"
-  local val="$2"
-  if ! grep -qE "^${key}=${val}$" .config; then
-    echo "CRITICAL: ${key}=${val} not found — got: $(grep "^${key}=" .config 2>/dev/null || echo '(not set)')"
+  if ! grep -qE "^${1}=${2}$" .config; then
+    echo "CRITICAL: ${1}=${2} not found - got: $(grep "^${1}=" .config 2>/dev/null || echo '(not set)')"
     FAILED=1
   fi
 }
-
 _check_ym() {
-  local key="$1"
-  if ! grep -qE "^${key}=[ym]$" .config; then
-    echo "CRITICAL: ${key} not set to y or m — got: $(grep "^${key}=" .config 2>/dev/null || echo '(not set)')"
+  if ! grep -qE "^${1}=[ym]$" .config; then
+    echo "CRITICAL: ${1} not =y or =m - got: $(grep "^${1}=" .config 2>/dev/null || echo '(not set)')"
     FAILED=1
   fi
 }
-
 _warn_ym() {
-  local key="$1"
-  if ! grep -qE "^${key}=[ym]$" .config; then
-    echo "WARN: ${key} absent/not y/m — got: $(grep "^${key}=" .config 2>/dev/null || echo '(not set)')"
-  fi
+  grep -qE "^${1}=[ym]$" .config || \
+    echo "WARN: ${1} absent - $(grep "^${1}=" .config 2>/dev/null || echo '(not set)')"
 }
 
 _check_eq  CONFIG_HZ_100                      y
@@ -329,34 +399,64 @@ _check_ym  CONFIG_IWLMVM
 _check_ym  CONFIG_OVERLAY_FS
 _check_ym  CONFIG_VETH
 _check_ym  CONFIG_BRIDGE
+_check_ym  CONFIG_BPF
+_check_ym  CONFIG_BPF_SYSCALL
+_check_ym  CONFIG_BPF_JIT
+_check_ym  CONFIG_DEBUG_INFO_BTF
+_check_ym  CONFIG_SCHED_CLASS_EXT
+_check_ym  CONFIG_IO_URING
+_check_ym  CONFIG_MEMCG
+_check_ym  CONFIG_CFS_BANDWIDTH
+_check_ym  CONFIG_ZSWAP
 
-_warn_ym   CONFIG_GENERIC_CPU3
-_warn_ym   CONFIG_NET_SCH_FQ
-_warn_ym   CONFIG_PREEMPT_NONE_BUILD
-_warn_ym   CONFIG_NF_TABLES
-_warn_ym   CONFIG_BRIDGE_NETFILTER
-
-if [ "$FAILED" -ne 0 ]; then
-  echo "Aborting due to critical config failure."
-  echo "Relevant config:"
-  grep -E 'CONFIG_HZ=|CONFIG_HZ_100|CONFIG_PREEMPT|CONFIG_LTO|CONFIG_TRANSPARENT_HUGEPAGE|CONFIG_DRM_I915|CONFIG_TCP_CONG_BBR|CONFIG_IWLWIFI|CONFIG_IWLMVM|CONFIG_GENERIC_CPU3|CONFIG_NET_SCH_FQ|CONFIG_OVERLAY_FS|CONFIG_VETH|CONFIG_BRIDGE' .config || true
-  exit 1
+# PREEMPT_RT is incompatible with server throughput - fail hard.
+# PREEMPT_BUILD / PREEMPT_DYNAMIC are acceptable: scx_bpfland --server
+# delivers server-optimized scheduling regardless of static preemption model.
+# CachyOS server 7.x uses PREEMPT_BUILD as its base; PREEMPT_NONE_BUILD is
+# not a valid Kconfig symbol in this kernel tree.
+if grep -qE '^CONFIG_PREEMPT_RT=y' .config; then
+  echo "CRITICAL: PREEMPT_RT enabled - incompatible with server throughput"
+  grep -E '^CONFIG_PREEMPT' .config || true
+  FAILED=1
+else
+  PREEMPT_STATE="$(grep -E '^CONFIG_PREEMPT' .config | tr '\n' ' ' || echo '(none)')"
+  echo "INFO: preemption model: $PREEMPT_STATE"
+  echo "INFO: scx_bpfland --server provides server scheduling regardless."
 fi
 
+_warn_ym CONFIG_NET_SCH_FQ
+_warn_ym CONFIG_NF_TABLES
+_warn_ym CONFIG_BRIDGE_NETFILTER
+_warn_ym CONFIG_IOSCHED_ADIOS
+_warn_ym CONFIG_MQ_IOSCHED_ADIOS
+_warn_ym CONFIG_TLS
+_warn_ym CONFIG_XDP_SOCKETS
+_warn_ym CONFIG_NVME_MULTIPATH
+_warn_ym CONFIG_BLK_WBT
+_warn_ym CONFIG_CHECKPOINT_RESTORE
+_warn_ym CONFIG_INTEL_RAPL
+
+if [ "$FAILED" -ne 0 ]; then
+  echo "Aborting: critical config failure."
+  grep -E \
+    'CONFIG_HZ=|CONFIG_PREEMPT|CONFIG_LTO|CONFIG_TRANSPARENT_HUGEPAGE|CONFIG_DRM_I915|CONFIG_BBR|CONFIG_IWLWIFI|CONFIG_BPF|CONFIG_DEBUG_INFO_BTF|CONFIG_SCHED_CLASS_EXT|CONFIG_ZSWAP|CONFIG_IOSCHED_ADIOS' \
+    .config || true
+  exit 1
+fi
 echo "Critical config verified."
 
 echo "========== CONFIG SUMMARY =========="
 grep -E \
-  'CONFIG_HZ=|CONFIG_HZ_100|CONFIG_PREEMPT|CONFIG_CC_IS_CLANG|CONFIG_LTO_CLANG_THIN|CONFIG_TRANSPARENT_HUGEPAGE=|CONFIG_TRANSPARENT_HUGEPAGE_ALWAYS|CONFIG_DEFAULT_TCP_CONG|CONFIG_TCP_CONG_BBR=|CONFIG_DRM_I915=|CONFIG_IWLWIFI=|CONFIG_IWLMVM=|CONFIG_GENERIC_CPU3|CONFIG_NET_SCH_FQ=|CONFIG_LOCALVERSION|CONFIG_OVERLAY_FS=|CONFIG_VETH=|CONFIG_BRIDGE=' \
+  'CONFIG_HZ=|CONFIG_HZ_100|CONFIG_PREEMPT|CONFIG_CC_IS_CLANG|CONFIG_LTO_CLANG_THIN|CONFIG_TRANSPARENT_HUGEPAGE=|CONFIG_TRANSPARENT_HUGEPAGE_ALWAYS|CONFIG_DEFAULT_TCP_CONG|CONFIG_TCP_CONG_BBR=|CONFIG_DRM_I915=|CONFIG_IWLWIFI=|CONFIG_IWLMVM=|CONFIG_NET_SCH_FQ=|CONFIG_LOCALVERSION|CONFIG_OVERLAY_FS=|CONFIG_VETH=|CONFIG_BRIDGE=|CONFIG_BPF=|CONFIG_BPF_JIT=|CONFIG_DEBUG_INFO_BTF=|CONFIG_SCHED_CLASS_EXT=|CONFIG_ZSWAP=|CONFIG_IOSCHED_ADIOS=|CONFIG_RCU_LAZY=' \
   .config || true
 
 echo "========== BUILD =========="
-
-# Important:
-# - ARCH=x86_64 targets Lenovo.
-# - Host/container is ARM64.
-# - CROSS_COMPILE provides GNU cross tools expected by Debian packaging.
-# - CC explicitly targets x86_64 to avoid aarch64 clang default.
+# ARCH=x86_64         - cross-target (container is ARM64)
+# LLVM=1 LLVM_IAS=1   - full LLVM toolchain
+# CROSS_COMPILE       - GNU prefix for any non-LLVM packaging tools
+# CC                  - explicit x86_64 target in clang; ccache wraps transparently
+# KCFLAGS             - march=x86-64-v3 even if GENERIC_CPU3 is absent from Kconfig
+# KBUILD_DEBARCH=amd64 - prevent arm64-tagged debs from cross-build host
 make ARCH=x86_64 LLVM=1 LLVM_IAS=1 \
   CROSS_COMPILE=x86_64-linux-gnu- \
   CC="ccache clang --target=x86_64-linux-gnu" \
@@ -371,21 +471,18 @@ make ARCH=x86_64 LLVM=1 LLVM_IAS=1 \
 echo "========== COLLECT RELEASE ASSETS =========="
 rm -rf "$DIST"
 mkdir -p "$DIST"
-
 find "$BUILD" -maxdepth 3 -type f -name "*.deb" ! -name "*-dbg_*" -exec cp -v {} "$DIST/" \;
 
 cd "$DIST"
-
 ls linux-image-*.deb   >/dev/null 2>&1 || { echo "ERROR: no linux-image deb"; exit 1; }
 ls linux-headers-*.deb >/dev/null 2>&1 || { echo "ERROR: no linux-headers deb"; exit 1; }
-
 sha256sum *.deb > SHA256SUMS
 
 echo "========== BUILD MANIFEST =========="
-CLANG_VER="$(clang --version 2>/dev/null | head -1 | grep -oP '\d+\.\d+\.\d+' | head -1 || echo "unknown")"
-LLD_VER="$(ld.lld --version 2>/dev/null | head -1 | grep -oP '\d+\.\d+\.\d+' | head -1 || echo "unknown")"
+CLANG_VER="$(clang   --version 2>/dev/null | head -1 | grep -oP '\d+\.\d+\.\d+' | head -1 || echo "unknown")"
+LLD_VER="$(  ld.lld  --version 2>/dev/null | head -1 | grep -oP '\d+\.\d+\.\d+' | head -1 || echo "unknown")"
 
-cat > BUILD_MANIFEST <<MANIFEST
+cat > BUILD_MANIFEST << MANIFEST
 CLANG_VERSION=${CLANG_VER}
 LLD_VERSION=${LLD_VER}
 KERNEL_VERSION=${KVER}
@@ -393,14 +490,24 @@ PKGREL=${PKGREL}
 CACHY_COMMIT=${CACHY_COMMIT}
 CACHY_VARIANT=${CACHY_VARIANT}
 BUILD_DATE_UTC=$(date -u +%Y-%m-%dT%H:%M:%SZ)
-KERNEL_LOCALVERSION=-cachyos-edge-lenovov15g2
-SCHEDULER=eevdf
+KERNEL_LOCALVERSION=-cachyos-edge-lenovov15g2-servermax
+SCHEDULER=eevdf-servermax
+SCHED_EXT=compiled-in-scx_bpfland-server-auto-enabled
 CPU_TARGET=x86-64-v3
 TIMER_HZ=100
 LTO=ThinLTO
 THP=always
-PREEMPT=best-effort-none
-BASE=cachyos-rc
+PREEMPT=preempt_build-scx_bpfland_server
+ZSWAP=zstd-z3fold-20pct
+IO_SCHEDULER=adios-best-effort
+CPU_POLICY=performance-governor-epp-performance
+IO_URING=enabled
+TLS_OFFLOAD=enabled
+XDP_SOCKETS=enabled
+NVME_MULTIPATH=enabled
+CGROUP_V2=full
+RCU_LAZY=disabled
+BASE=cachyos-server
 MANIFEST
 
 cat BUILD_MANIFEST

@@ -3,8 +3,7 @@ name: Build Lenovo V15 G2 ITL CachyOS Edge Kernel
 on:
   workflow_dispatch:
   schedule:
-    # Wednesday 12:00 UTC = Thursday 00:00 NZST / 01:00 NZDT
-    - cron: "0 12 * * 3"
+    - cron: "0 9 * * *"
 
 permissions:
   contents: write
@@ -18,7 +17,7 @@ concurrency:
 
 jobs:
   build:
-    name: Build CachyOS edge kernel RC — ARM64 cross-compile to x86-64-v3 amd64
+    name: Build CachyOS edge kernel RC - ARM64 cross-compile to x86-64-v3 amd64
     runs-on: [self-hosted, Linux, ARM64, oracle-a1, tkg-builder]
     timeout-minutes: 720
 
@@ -33,20 +32,75 @@ jobs:
       - name: Show runner info
         run: |
           uname -a
-          lscpu | head -40 || true
+          lscpu | head -80 || true
           df -h
           free -h
           docker version
+          {
+            echo "## Runner"
+            echo '```'
+            uname -a
+            lscpu | head -80 || true
+            df -h
+            free -h
+            docker version 2>&1 || true
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
 
-          echo "## Runner" >> "$GITHUB_STEP_SUMMARY"
-          echo '```' >> "$GITHUB_STEP_SUMMARY"
-          uname -a >> "$GITHUB_STEP_SUMMARY"
-          df -h >> "$GITHUB_STEP_SUMMARY"
-          free -h >> "$GITHUB_STEP_SUMMARY"
-          docker version >> "$GITHUB_STEP_SUMMARY" 2>&1 || true
-          echo '```' >> "$GITHUB_STEP_SUMMARY"
+      - name: Pre-flight - skip if kernel version already released
+        id: preflight
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
 
-      - name: Build or restore builder image
+          # CACHY_TMPDIR not TMPDIR - avoids clobbering the $TMPDIR stdlib env var
+          CACHY_TMPDIR="$(mktemp -d)"
+          git clone --depth=1 --quiet \
+            https://github.com/CachyOS/linux-cachyos.git "$CACHY_TMPDIR"
+
+          KVER="$(bash -c "
+            cd '$CACHY_TMPDIR/linux-cachyos-server'
+            prepare(){ true; }; build(){ true; }; package(){ true; }
+            source PKGBUILD 2>/dev/null || true
+            printf '%s' \"\${pkgver:-}\"
+          " 2>/dev/null | tr -d $'\n')"
+
+          CACHY_COMMIT="$(git -C "$CACHY_TMPDIR" rev-parse --short HEAD || true)"
+          rm -rf "$CACHY_TMPDIR"
+
+          echo "Upstream pkgver: $KVER"
+          echo "CachyOS commit:  $CACHY_COMMIT"
+          echo "kver=$KVER"           >> "$GITHUB_OUTPUT"
+          echo "cachy_commit=$CACHY_COMMIT" >> "$GITHUB_OUTPUT"
+
+          if [ -z "$KVER" ]; then
+            echo "Could not read upstream version - proceeding with build"
+            echo "skip=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          # Check 50 most recent releases (includes prereleases) for servermax tag
+          RECENT="$(gh release list \
+            --repo "${{ github.repository }}" \
+            --limit 50 \
+            --json tagName \
+            --jq '.[].tagName' 2>/dev/null || true)"
+
+          if echo "$RECENT" | grep -qF "v${KVER}-cachyos-edge-x86_64v3-servermax-"; then
+            echo "SKIP: $KVER already has a servermax release."
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+            {
+              echo "### Skipped - already built"
+              echo "Upstream \`$KVER\` already present in servermax releases."
+            } >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo "BUILD: $KVER not yet released as servermax"
+            echo "skip=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Build builder image
+        if: steps.preflight.outputs.skip != 'true'
         run: |
           docker build \
             -t cachyos-builder:latest \
@@ -54,6 +108,7 @@ jobs:
             .
 
       - name: Build kernel
+        if: steps.preflight.outputs.skip != 'true'
         run: |
           chmod +x scripts/build-cachyos-server.sh
           mkdir -p dist
@@ -62,63 +117,70 @@ jobs:
           mkdir -p "$CCACHE_HOST"
 
           docker run --rm \
-            --shm-size=2g \
+            --shm-size=4g \
+            --ulimit nofile=1048576:1048576 \
             -v "$PWD:/work" \
             -v "$CCACHE_HOST:/ccache" \
             -w /work \
             -e CCACHE_DIR=/ccache \
-            -e CCACHE_MAXSIZE=20G \
+            -e CCACHE_MAXSIZE=30G \
             -e HOST_UID="$(id -u)" \
             -e HOST_GID="$(id -g)" \
-            -e CACHY_VARIANT="linux-cachyos-rc" \
+            -e CACHY_VARIANT="linux-cachyos-server" \
             cachyos-builder:latest \
             bash /work/scripts/build-cachyos-server.sh
 
       - name: Verify release assets
+        if: steps.preflight.outputs.skip != 'true'
         run: |
+          set -euo pipefail
+
           ls -lh dist/
           test -f dist/SHA256SUMS
           test -f dist/BUILD_MANIFEST
-          test "$(find dist -name 'linux-image-*.deb' | wc -l)" -ge 1
+          test "$(find dist -name 'linux-image-*.deb'   | wc -l)" -ge 1
           test "$(find dist -name 'linux-headers-*.deb' | wc -l)" -ge 1
 
           echo "Verifying .deb integrity ..."
           for deb in dist/*.deb; do
-            dpkg --info "$deb" > /dev/null
+            dpkg --info "$deb" >/dev/null
           done
 
-          echo "## Built packages" >> "$GITHUB_STEP_SUMMARY"
-          echo '```' >> "$GITHUB_STEP_SUMMARY"
-          ls -lh dist/ >> "$GITHUB_STEP_SUMMARY"
-          echo '```' >> "$GITHUB_STEP_SUMMARY"
-
-          echo "**Build manifest:**" >> "$GITHUB_STEP_SUMMARY"
-          echo '```' >> "$GITHUB_STEP_SUMMARY"
-          cat dist/BUILD_MANIFEST >> "$GITHUB_STEP_SUMMARY"
-          echo '```' >> "$GITHUB_STEP_SUMMARY"
-
-          echo "**SHA-256 checksums:**" >> "$GITHUB_STEP_SUMMARY"
-          echo '```' >> "$GITHUB_STEP_SUMMARY"
-          cat dist/SHA256SUMS >> "$GITHUB_STEP_SUMMARY"
-          echo '```' >> "$GITHUB_STEP_SUMMARY"
+          {
+            echo "## Built packages"
+            echo '```'
+            ls -lh dist/
+            echo '```'
+            echo "**Build manifest:**"
+            echo '```'
+            cat dist/BUILD_MANIFEST
+            echo '```'
+            echo "**SHA-256 checksums:**"
+            echo '```'
+            cat dist/SHA256SUMS
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
 
           CCACHE_HOST="$HOME/.cache/ccache-cachyos"
           if [ -d "$CCACHE_HOST" ]; then
-            echo "**ccache stats:**" >> "$GITHUB_STEP_SUMMARY"
-            echo '```' >> "$GITHUB_STEP_SUMMARY"
-            CCACHE_DIR="$CCACHE_HOST" ccache -s >> "$GITHUB_STEP_SUMMARY" 2>/dev/null || true
-            echo '```' >> "$GITHUB_STEP_SUMMARY"
+            {
+              echo "**ccache stats:**"
+              echo '```'
+              CCACHE_DIR="$CCACHE_HOST" ccache -s 2>/dev/null || true
+              echo '```'
+            } >> "$GITHUB_STEP_SUMMARY"
           fi
 
       - name: Upload build artifacts
         uses: actions/upload-artifact@v4
-        if: always()
+        if: always() && steps.preflight.outputs.skip != 'true'
         with:
-          name: cachyos-edge-debs-run${{ github.run_number }}-${{ github.run_attempt }}
+          name: cachyos-servermax-debs-run${{ github.run_number }}-${{ github.run_attempt }}
           path: dist/
           retention-days: 7
 
       - name: Create GitHub Release
+        if: steps.preflight.outputs.skip != 'true'
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
@@ -126,47 +188,47 @@ jobs:
 
           source dist/BUILD_MANIFEST
 
-          DEB="$(find dist -name 'linux-image-*.deb' | sort | head -1)"
-          KVER_PKG="$(basename "$DEB" | sed 's/linux-image-//' | cut -d_ -f1)"
-
-          KVER_NUM="$(echo "$KVER_PKG" | sed 's/-[0-9]*-cachyos$//' | sed 's/-[0-9]*$//')"
           BUILD_DATE="$(date -u +%Y-%m-%d)"
           BUILD_DATE_NODASH="$(date -u +%Y%m%d)"
           CHECKSUMS="$(cat dist/SHA256SUMS)"
 
-          TAG="v${KVER_NUM}-cachyos-edge-x86_64v3-${BUILD_DATE_NODASH}.${GITHUB_RUN_NUMBER}.${GITHUB_RUN_ATTEMPT}"
-          TITLE="Linux ${KVER_PKG} • CachyOS Edge • Lenovo V15 G2 ITL • ${BUILD_DATE}"
+          TAG="v${KERNEL_VERSION}-cachyos-edge-x86_64v3-servermax-${BUILD_DATE_NODASH}.${GITHUB_RUN_NUMBER}"
+          TITLE="Linux ${KERNEL_VERSION} • CachyOS ServerMax • Lenovo V15 G2 ITL • ${BUILD_DATE}"
 
           PRERELEASE_OPTS=()
-          echo "$KVER_NUM" | grep -qi 'rc' && PRERELEASE_OPTS+=(--prerelease)
+          echo "$KERNEL_VERSION" | grep -qi 'rc' && PRERELEASE_OPTS+=(--prerelease)
 
           cat > /tmp/release-notes.md << NOTES_EOF
-          ## Linux ${KVER_PKG} — CachyOS Edge
+          ## Linux ${KERNEL_VERSION}, CachyOS ServerMax
 
-          Bleeding-edge CachyOS kernel build for the **Lenovo V15 G2 ITL** with Intel Core i5-1135G7 / Tiger Lake.
+          AC-powered, server-throughput CachyOS kernel for the **Lenovo V15 G2 ITL** - Intel Core i5-1135G7 / Tiger Lake.
 
           ### Build Configuration
 
-          - Kernel version: \`${KVER_PKG}\`
+          - Kernel version: \`${KERNEL_VERSION}${KERNEL_LOCALVERSION}\`
           - CachyOS variant: \`${CACHY_VARIANT}\`
-          - Scheduler: \`${SCHEDULER}\`
+          - Base scheduler: \`${SCHEDULER}\`
+          - sched_ext support: \`${SCHED_EXT}\`
           - Compiler: LLVM / Clang \`${CLANG_VERSION}\` + LLD \`${LLD_VERSION}\`
           - LTO: \`${LTO}\`
           - CPU target: \`${CPU_TARGET}\`
           - Timer frequency: \`${TIMER_HZ} Hz\`
           - Transparent Huge Pages: \`${THP}\`
           - Preemption model: \`${PREEMPT}\`
+          - I/O scheduler: \`${IO_SCHEDULER}\`
+          - CPU policy: \`${CPU_POLICY}\`
+          - RCU lazy: \`${RCU_LAZY}\`
           - Kernel local version: \`${KERNEL_LOCALVERSION}\`
 
           ### Target Hardware
 
           - Device: Lenovo V15 G2 ITL
-          - CPU: Intel Core i5-1135G7 / Tiger Lake
-          - iGPU: Intel Iris Xe / i915 / Quick Sync
-          - WiFi: Intel AX201
-          - Runtime GPU option: \`i915.enable_guc=3\`
+          - CPU: Intel Core i5-1135G7 / Tiger Lake (x86-64-v3)
+          - iGPU: Intel Iris Xe / i915 / Quick Sync (\`i915.enable_guc=3\`)
+          - Wi-Fi: Intel AX201
+          - Zswap: \`zswap.enabled=1 zswap.compressor=lz4 zswap.max_pool_percent=20\`
 
-          ### Checksums
+          ### SHA-256 Checksums
 
           \`\`\`
           ${CHECKSUMS}
@@ -177,7 +239,7 @@ jobs:
           - Build timestamp: \`${BUILD_DATE_UTC}\`
           - linux-cachyos commit: \`${CACHY_COMMIT}\`
           - Workflow run: ${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}
-          - Builder: Oracle Ampere A1 ARM64
+          - Builder: Oracle Ampere A1 ARM64 (cross-compile, no QEMU)
           - Output: Debian/Ubuntu amd64 \`.deb\` packages
           NOTES_EOF
 
@@ -188,15 +250,16 @@ jobs:
             --notes-file /tmp/release-notes.md
 
           RELEASE_URL="${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/releases/tag/${TAG}"
-
-          echo "## Release created" >> "$GITHUB_STEP_SUMMARY"
-          echo "" >> "$GITHUB_STEP_SUMMARY"
-          echo "$RELEASE_URL" >> "$GITHUB_STEP_SUMMARY"
-          echo "" >> "$GITHUB_STEP_SUMMARY"
-          echo "| Field | Value |" >> "$GITHUB_STEP_SUMMARY"
-          echo "|-------|-------|" >> "$GITHUB_STEP_SUMMARY"
-          echo "| Tag | \`$TAG\` |" >> "$GITHUB_STEP_SUMMARY"
-          echo "| Kernel | \`$KVER_PKG\` |" >> "$GITHUB_STEP_SUMMARY"
-          echo "| Clang | \`$CLANG_VERSION\` |" >> "$GITHUB_STEP_SUMMARY"
-          echo "| LLD | \`$LLD_VERSION\` |" >> "$GITHUB_STEP_SUMMARY"
-          echo "| linux-cachyos | \`$CACHY_COMMIT\` |" >> "$GITHUB_STEP_SUMMARY"
+          {
+            echo "## Release created"
+            echo ""
+            echo "$RELEASE_URL"
+            echo ""
+            echo "| Field | Value |"
+            echo "|-------|-------|"
+            echo "| Tag | \`$TAG\` |"
+            echo "| Kernel | \`$KERNEL_VERSION\` |"
+            echo "| Clang | \`$CLANG_VERSION\` |"
+            echo "| LLD | \`$LLD_VERSION\` |"
+            echo "| linux-cachyos | \`$CACHY_COMMIT\` |"
+          } >> "$GITHUB_STEP_SUMMARY"
