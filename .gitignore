@@ -1,0 +1,36 @@
+# Build outputs
+dist/
+build/
+DEBS/
+RPMS/
+logs/
+tmp/
+.cache/
+
+# Kernel packages/artifacts
+*.deb
+*.buildinfo
+*.changes
+*.log
+*.tmp
+linux-upstream_*
+linux-image-*
+linux-headers-*
+linux-libc-dev_*
+
+# Editor/OS
+.DS_Store
+*.claude
+*.claude/
+*.remember/
+# IDEs
+.idea/
+.vscode/
+*.sublime-project
+*.sublime-workspace
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+*.env
