@@ -1,4 +1,4 @@
-name: Build Lenovo V15 G2 ITL CachyOS ServerMax Kernel
+name: Build ASUS NUC 15 Pro CachyOS ServerMax Kernel
 
 on:
   workflow_dispatch:
@@ -12,12 +12,12 @@ env:
   FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
 
 concurrency:
-  group: lenovo-v15g2-itl-cachyos-servermax-kernel
+  group: asus-nuc15pro-cachyos-servermax-kernel
   cancel-in-progress: false
 
 jobs:
   build:
-    name: Build CachyOS ServerMax kernel, ARM64 cross-compile to x86-64-v3 amd64
+    name: Build CachyOS ServerMax kernel for NUC 15 Pro, ARM64 cross-compile to x86-64-v3 amd64
     runs-on: [self-hosted, Linux, ARM64, oracle-a1, tkg-builder]
     timeout-minutes: 720
 
@@ -297,7 +297,7 @@ jobs:
           CHECKSUMS="$(cat dist/SHA256SUMS)"
 
           TAG="v${KERNEL_VERSION}-cachyos-servermax-x86_64v3-${BUILD_DATE_NODASH}.${GITHUB_RUN_NUMBER}"
-          TITLE="Linux ${KERNEL_VERSION} • CachyOS ServerMax • Lenovo V15 G2 ITL • ${BUILD_DATE}"
+          TITLE="Linux ${KERNEL_VERSION} • CachyOS ServerMax • ASUS NUC 15 Pro • ${BUILD_DATE}"
 
           PRERELEASE_OPTS=()
           echo "$KERNEL_VERSION" | grep -qi 'rc' && PRERELEASE_OPTS+=(--prerelease)
@@ -305,7 +305,7 @@ jobs:
           cat > /tmp/release-notes.md << NOTES_EOF
           ## Linux ${KERNEL_VERSION}, CachyOS ServerMax
 
-          AC-powered, full-throughput CachyOS ServerMax kernel for **Lenovo V15 G2 ITL** with Intel Core i5-1135G7 / Tiger Lake.
+          AC-powered, full-throughput CachyOS ServerMax kernel for **ASUS NUC 15 Pro** with Intel Core Ultra 5 225H / Arrow Lake-H.
 
           ### Build Configuration
 
@@ -328,7 +328,7 @@ jobs:
 
           - CPU governor: \`performance\`
           - Intel EPP: \`performance\`
-          - Intel iGPU GuC/HuC: \`i915.enable_guc=3\`
+          - GPU driver: \`xe\` (Intel Arc 130T Xe2-LPG, GuC auto-enabled)
           - SCX server scheduler: \`scx_bpfland -s 20000 -S\`
           - zswap: \`zstd\`, \`z3fold\`, \`20%\`
           - TCP: \`bbr\` + \`fq\`

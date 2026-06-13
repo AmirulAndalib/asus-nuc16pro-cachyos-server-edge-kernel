@@ -1,12 +1,12 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-OWNER_REPO="${OWNER_REPO:-AmirulAndalib/lenovo-v15g2-itl-cachyos-server-edge-kernel}"
+OWNER_REPO="${OWNER_REPO:-AmirulAndalib/asus-nuc15pro-cachyos-server-edge-kernel}"
 
-STATE_DIR="/var/lib/lenovo-kernel-updater"
-LOG_DIR="/var/log/lenovo-kernel-updater"
-WORK_DIR="/tmp/lenovo-kernel-install"
-LOCK_FILE="/run/lenovo-kernel-updater.lock"
+STATE_DIR="/var/lib/nuc15pro-kernel-updater"
+LOG_DIR="/var/log/nuc15pro-kernel-updater"
+WORK_DIR="/tmp/nuc15pro-kernel-install"
+LOCK_FILE="/run/nuc15pro-kernel-updater.lock"
 
 mkdir -p "$STATE_DIR" "$LOG_DIR" "$WORK_DIR"
 
@@ -21,15 +21,15 @@ exec > >(tee -a "$LOG") 2>&1
 
 msg() { echo ":: $*"; }
 
-# Keep newest installed cachyos-lenovov15g2 kernel + currently running kernel.
-# Purge all other cachyos-lenovov15g2 image and header packages.
+# Keep newest installed cachyos-nuc15pro kernel + currently running kernel.
+# Purge all other cachyos-nuc15pro image and header packages.
 # Must run before update-initramfs to avoid regenerating for kernels about to be removed.
 purge_old_custom_kernels() {
   local target_kver="$1"
   msg "purging old custom kernels"
 
   mapfile -t ALL_CUSTOM_IMG < <(
-    dpkg -l | awk '/^ii/ && /linux-image-.*cachyos.*lenovov15g2/ {print $2}' | sort -V
+    dpkg -l | awk '/^ii/ && /linux-image-.*cachyos.*nuc15pro/ {print $2}' | sort -V
   )
 
   if [ "${#ALL_CUSTOM_IMG[@]}" -le 1 ]; then
@@ -76,7 +76,7 @@ purge_old_custom_kernels() {
   apt-get purge -y "${PKGS_TO_PURGE[@]}" || true
 }
 
-msg "lenovo kernel updater"
+msg "nuc15pro kernel updater"
 date
 uname -a
 
@@ -110,10 +110,10 @@ NEED_REBOOT_ONLY=0
 if [ -f "$LAST_TAG_FILE" ] && [ "$(cat "$LAST_TAG_FILE")" = "$TAG" ]; then
   echo "$TAG already recorded as installed"
 
-  if echo "$CURRENT_KERNEL" | grep -q 'cachyos.*lenovov15g2'; then
+  if echo "$CURRENT_KERNEL" | grep -q 'cachyos.*nuc15pro'; then
     echo "already running custom kernel, re-applying tuning and checking SCX"
     NEED_REBOOT_ONLY=2
-  elif dpkg -l | grep -qE '^ii[[:space:]]+linux-image-.*cachyos.*lenovov15g2'; then
+  elif dpkg -l | grep -qE '^ii[[:space:]]+linux-image-.*cachyos.*nuc15pro'; then
     echo "custom kernel installed but not running, will set GRUB default and reboot"
     NEED_REBOOT_ONLY=1
   fi
@@ -191,13 +191,16 @@ BACKUP_DIR="$STATE_DIR/backups/$(date +%Y%m%d-%H%M%S)"
 mkdir -p "$BACKUP_DIR"
 cp -a /etc/default/grub "$BACKUP_DIR/grub.bak" 2>/dev/null || true
 
-# Intel Tiger Lake Iris Xe - hardware GuC submission + HuC media firmware
-install -Dm644 /dev/stdin /etc/modprobe.d/i915-guc.conf <<'MODPROBE'
-options i915 enable_guc=3
+# Intel Arc 130T (Xe2-LPG) — xe driver, no i915 options needed
+# xe driver auto-enables GuC firmware submission; no modprobe options required
+install -Dm644 /dev/stdin /etc/modprobe.d/xe-arc130t.conf <<'MODPROBE'
+# Intel Arc 130T (Arrow Lake Xe2-LPG) — xe driver
+# GuC firmware submission is enabled by default in xe; no options needed.
+# i915 is kept as fallback module but Arc 130T will bind to xe at boot.
 MODPROBE
 
 # server sysctl tuning
-install -Dm644 /dev/stdin /etc/sysctl.d/99-lenovo-v15g2-servermax.conf <<'SYSCTL'
+install -Dm644 /dev/stdin /etc/sysctl.d/99-nuc15pro-servermax.conf <<'SYSCTL'
 # TCP: BBR + FQ
 net.core.default_qdisc             = fq
 net.ipv4.tcp_congestion_control    = bbr
@@ -223,21 +226,33 @@ vm.dirty_ratio                     = 20
 fs.file-max                        = 2097152
 net.core.netdev_max_backlog        = 16384
 
-# Intel GPU perf monitoring
-dev.i915.perf_stream_paranoid      = 0
+# Dual NIC: loose reverse-path filter allows multi-homed WiFi+ETH simultaneously.
+# rp_filter=2 (loose) instead of 1 (strict) so both NICs can receive traffic
+# when routing via the other interface (e.g. default via eth, DNS via wifi).
+# NOT setting ip_forward — this is a workstation, not a router.
+net.ipv4.conf.all.rp_filter        = 2
+net.ipv4.conf.default.rp_filter    = 2
+
+# NVMe: disable power-saving latency states for Gen4/Gen5 max throughput
+# (mirrors kernel cmdline nvme_core.default_ps_max_latency_us=0)
+# This is belt-and-suspenders; cmdline takes effect earlier at boot.
+# dev.nvme is not a sysctl namespace — NVMe PS is controlled via cmdline only.
 SYSCTL
 
 # I/O scheduler: ADIOS for SSDs/NVMe, BFQ for spinning disks
-install -Dm644 /dev/stdin /etc/udev/rules.d/60-lenovo-v15g2-ioschedulers.rules <<'UDEV'
+install -Dm644 /dev/stdin /etc/udev/rules.d/60-nuc15pro-ioschedulers.rules <<'UDEV'
 ACTION=="add|change", KERNEL=="sd[a-z]", ATTR{queue/rotational}=="1", ATTR{queue/scheduler}="bfq"
 ACTION=="add|change", KERNEL=="sd[a-z]|mmcblk[0-9]", ATTR{queue/rotational}=="0", ATTR{queue/scheduler}="adios"
 ACTION=="add|change", KERNEL=="nvme[0-9]n[0-9]", ATTR{queue/rotational}=="0", ATTR{queue/scheduler}="adios"
 UDEV
 
 # CPU performance governor + EPP via systemd oneshot
-install -Dm644 /dev/stdin /etc/systemd/system/lenovo-v15g2-servermax-cpupower.service <<'SERVICE'
+# Arrow Lake-H: 4P (Lion Cove) + 8E (Skymont) + 2LP-E (Crestmont), no HT
+# All CPU* loops cover P/E/LP-E uniformly; Intel Thread Director + HFI
+# handles per-core-type scheduling automatically at the firmware level.
+install -Dm644 /dev/stdin /etc/systemd/system/nuc15pro-servermax-cpupower.service <<'SERVICE'
 [Unit]
-Description=Lenovo V15 G2 ITL ServerMax CPU full performance policy
+Description=NUC 15 Pro ServerMax CPU full performance policy (Arrow Lake-H P/E/LP-E)
 After=multi-user.target
 
 [Service]
@@ -251,7 +266,7 @@ WantedBy=multi-user.target
 SERVICE
 
 systemctl daemon-reload
-systemctl enable lenovo-v15g2-servermax-cpupower.service || true
+systemctl enable nuc15pro-servermax-cpupower.service || true
 
 msg "installing sched_ext schedulers"
 
@@ -317,8 +332,12 @@ for b in scx_bpfland scx_p2dq scx_rusty scx_beerland scx_lavd scx_loader scxctl;
 done
 
 msg "configuring sched_ext server mode"
-# scx_bpfland -s 20000 -S: 20ms slice for throughput, -S for strict-affinity server tasks
-# fallback chain: bpfland -> p2dq -> bpfland (no args) -> rusty -> beerland -> lavd
+# Primary: scx_bpfland -s 20000 -S (20ms slice, strict-affinity server tasks)
+# Fallback chain: p2dq -> bpfland (no args) -> rusty -> beerland -> lavd
+#
+# scx_lavd is topology-aware for Arrow Lake P/E/LP-E but has a documented
+# E-core over-prioritization issue (observed on Lunar Lake, sibling arch).
+# Keep lavd at end of fallback chain until upstream resolves it.
 
 install -Dm755 /dev/stdin /usr/local/sbin/scx-servermax-start.sh <<'SCX_WRAPPER'
 #!/bin/sh
@@ -343,9 +362,9 @@ echo "no scx scheduler found, kernel EEVDF remains active"
 exit 0
 SCX_WRAPPER
 
-install -Dm644 /dev/stdin /etc/systemd/system/lenovo-v15g2-scx-server.service <<'SCX_SVC'
+install -Dm644 /dev/stdin /etc/systemd/system/nuc15pro-scx-server.service <<'SCX_SVC'
 [Unit]
-Description=sched_ext server scheduler - Lenovo V15 G2 ITL
+Description=sched_ext server scheduler - ASUS NUC 15 Pro (Arrow Lake-H)
 Documentation=https://github.com/sched-ext/scx
 After=multi-user.target
 ConditionPathIsDirectory=/sys/kernel/sched_ext
@@ -370,18 +389,18 @@ default_mode  = "Server"
 SCX_CFG
   systemctl daemon-reload
   systemctl enable --now scx_loader.service || true
-  systemctl disable lenovo-v15g2-scx-server.service 2>/dev/null || true
+  systemctl disable nuc15pro-scx-server.service 2>/dev/null || true
 else
-  systemctl enable --now lenovo-v15g2-scx-server.service || true
+  systemctl enable --now nuc15pro-scx-server.service || true
 fi
 
 if [ "$NEED_REBOOT_ONLY" -eq 2 ]; then
   SCX_ACTIVE=0
-  systemctl is-active --quiet lenovo-v15g2-scx-server.service 2>/dev/null && SCX_ACTIVE=1 || true
-  systemctl is-active --quiet scx_loader.service              2>/dev/null && SCX_ACTIVE=1 || true
+  systemctl is-active --quiet nuc15pro-scx-server.service 2>/dev/null && SCX_ACTIVE=1 || true
+  systemctl is-active --quiet scx_loader.service          2>/dev/null && SCX_ACTIVE=1 || true
   if [ "$SCX_ACTIVE" -eq 0 ]; then
     echo "SCX not active, attempting restart..."
-    systemctl restart lenovo-v15g2-scx-server.service 2>/dev/null || \
+    systemctl restart nuc15pro-scx-server.service 2>/dev/null || \
       systemctl restart scx_loader.service 2>/dev/null || true
   else
     echo "SCX active"
@@ -418,17 +437,21 @@ for kv in "GRUB_TIMEOUT=0" "GRUB_TIMEOUT_STYLE=hidden"; do
   fi
 done
 
-# deduplicate existing params then append ours
-GRUB_CMDLINE_ADD="i915.enable_guc=3 zswap.enabled=1 zswap.shrinker_enabled=1 zswap.compressor=zstd zswap.max_pool_percent=20 zswap.zpool=z3fold mitigations=auto intel_pstate=active"
+# threadirqs: spread interrupts across P/E/LP-E cores for better I/O latency
+# nvme_core.default_ps_max_latency_us=0: disable NVMe power states (Gen4/Gen5 max throughput)
+# No i915.enable_guc=3 — Arc 130T uses xe driver, not i915
+GRUB_CMDLINE_ADD="threadirqs nvme_core.default_ps_max_latency_us=0 zswap.enabled=1 zswap.shrinker_enabled=1 zswap.compressor=zstd zswap.max_pool_percent=20 zswap.zpool=z3fold mitigations=auto intel_pstate=active"
 
 if grep -q '^GRUB_CMDLINE_LINUX_DEFAULT=' /etc/default/grub; then
   CURRENT="$(grep '^GRUB_CMDLINE_LINUX_DEFAULT=' /etc/default/grub | \
     sed -E 's/^GRUB_CMDLINE_LINUX_DEFAULT="(.*)"/\1/')"
 
-  for param in i915.enable_guc zswap.enabled zswap.shrinker_enabled \
-               zswap.compressor zswap.max_pool_percent zswap.zpool \
-               rcutree.enable_rcu_lazy mitigations intel_pstate; do
-    CURRENT="$(echo "$CURRENT" | sed -E "s/(^| )${param}=[^ ]+//g")"
+  # Remove stale Lenovo/Tiger Lake params and any we're about to re-add
+  for param in i915.enable_guc threadirqs nvme_core.default_ps_max_latency_us \
+               zswap.enabled zswap.shrinker_enabled zswap.compressor \
+               zswap.max_pool_percent zswap.zpool rcutree.enable_rcu_lazy \
+               mitigations intel_pstate; do
+    CURRENT="$(echo "$CURRENT" | sed -E "s/(^| )${param}=[^ ]+//g; s/(^| )${param}( |$)/ /g")"
   done
 
   NEW="$(echo "$CURRENT $GRUB_CMDLINE_ADD" | xargs)"
@@ -451,7 +474,7 @@ update-grub
 msg "setting grub default"
 
 TARGET_KERNEL="$(
-  ls /boot/vmlinuz-*cachyos*lenovov15g2*servermax* 2>/dev/null |
+  ls /boot/vmlinuz-*cachyos*nuc15pro*servermax* 2>/dev/null |
     sed 's|/boot/vmlinuz-||' |
     sort -V |
     tail -n1
@@ -490,7 +513,7 @@ msg "status"
 dpkg -l | grep -iE 'cachyos|linux-image|linux-headers' || true
 ls -lh /boot | grep -E 'cachyos|vmlinuz|initrd' || true
 
-systemctl status lenovo-v15g2-scx-server.service --no-pager -l | head -60 || true
+systemctl status nuc15pro-scx-server.service --no-pager -l | head -60 || true
 systemctl status scx_loader.service --no-pager -l | head -30 2>/dev/null || true
 [ -r /sys/kernel/sched_ext/state ] && echo "sched_ext: $(cat /sys/kernel/sched_ext/state)"
 

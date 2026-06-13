@@ -171,7 +171,7 @@ chmod +x ./scripts/config
 msg "applying servermax config tweaks"
 
 # LOCALVERSION must be set via scripts/config (string, not boolean)
-./scripts/config --set-str LOCALVERSION "-cachyos-edge-lenovov15g2-servermax"
+./scripts/config --set-str LOCALVERSION "-cachyos-edge-nuc15pro-servermax"
 
 # Use merge_config.sh for everything else - it processes the fragment through
 # Kconfig and resolves choice blocks properly. scripts/config does not understand
@@ -320,26 +320,34 @@ CONFIG_LZ4_DECOMPRESS=y
 CONFIG_Z3FOLD=y
 CONFIG_ZSMALLOC=y
 
-# ---- Intel Tiger Lake iGPU / Iris Xe / Quick Sync ----
+# ---- Intel Arc 130T (Xe2-LPG) iGPU — Arrow Lake (xe driver primary) ----
+# xe is the modern driver for Xe2+ GPUs (Arc 130T, device 0x7D51)
+# Keep i915 built as module for DRM subsystem compat / future fallback
+CONFIG_DRM_XE=m
 CONFIG_DRM_I915=m
 CONFIG_DRM_I915_GVT_KVMGT=m
 
-# ---- Intel CPU power management ----
+# ---- Intel CPU power management (Arrow Lake: P/E/LP-E, Thread Director, HFI) ----
 CONFIG_X86_INTEL_PSTATE=y
 CONFIG_INTEL_IDLE=y
 CONFIG_THERMAL=y
 CONFIG_THERMAL_GOV_POWER_ALLOCATOR=y
 CONFIG_INTEL_HFI_THERMAL=y
 CONFIG_INTEL_RAPL=m
+# Uncore frequency scaling for Arrow Lake ring/LLC; Speed Select for core-type hints
+CONFIG_INTEL_UNCORE_FREQ_CONTROL=m
+CONFIG_INTEL_SPEED_SELECT_INTERFACE=m
 
-# ---- Wi-Fi: Intel AX201 ----
+# ---- Wi-Fi: Intel BE201 (Wi-Fi 7, 320 MHz, MLO) ----
 CONFIG_IWLWIFI=m
 CONFIG_IWLMVM=m
+# ME-over-WiFi (CSME firmware channel) — optional, soft check
+CONFIG_IWLMEI=m
 
-# ---- Sound: Intel SOF / SoundWire / HDA ----
+# ---- Sound: Intel SOF / SoundWire / HDA (SOF TGL config covers Arrow Lake) ----
 CONFIG_SND_SOC_SOF=m
 CONFIG_SND_SOC_SOF_INTEL_SOUNDWIRE_LINK=y
-CONFIG_SND_SOC_SOF_TIGERLAKE=m
+CONFIG_SND_SOC_SOF_INTEL_TGL=m
 CONFIG_SND_HDA_INTEL=m
 
 # ---- Thunderbolt / USB4 ----
@@ -350,10 +358,36 @@ CONFIG_USB4=m
 CONFIG_INTEL_PMT_TELEMETRY=m
 CONFIG_INTEL_PMT_CRASHLOG=m
 
-# ---- PCIe performance ----
+# ---- PCIe performance (Gen4/Gen5 NVMe zero-latency PS) ----
 CONFIG_PCIEASPM=y
 CONFIG_PCIEASPM_PERFORMANCE=y
 CONFIG_PCIE_PTM=y
+
+# ---- Intel 2.5GbE: I226-V (NUC 15 Pro onboard) ----
+CONFIG_IGC=m
+
+# ---- Intel NPU AI Boost (Arrow Lake, 13 TOPS) ----
+CONFIG_DRM_ACCEL_IVPU=m
+
+# ---- Dual NIC: multi-home WiFi 7 + 2.5GbE simultaneously ----
+# MULTIQ supports per-TC queuing needed for bonding/multi-path
+# IP_MULTIPLE_TABLES enables policy routing for per-interface routing
+CONFIG_NET_SCH_MULTIQ=m
+CONFIG_IP_MULTIPLE_TABLES=y
+CONFIG_IP_ROUTE_MULTIPATH=y
+
+# ---- USB: SuperSpeed+ (Gen2x2 20Gbps), xHCI, USB4 performance ----
+CONFIG_USB_XHCI_HCD=m
+CONFIG_USB_XHCI_PLATFORM=m
+# USB authorized default: all ports enabled (no manual authorize needed)
+CONFIG_USB_DEFAULT_AUTHORIZATION_MODE=1
+
+# ---- NVMe: Gen4/Gen5, multipath, writeback ----
+CONFIG_NVME_CORE=m
+CONFIG_BLK_DEV_NVME=m
+CONFIG_NVME_VERBOSE_ERRORS=y
+# NVMe TCP for remote storage (optional)
+CONFIG_NVME_TCP=m
 
 # ---- Misc performance ----
 CONFIG_SCHED_AUTOGROUP=y
@@ -391,7 +425,6 @@ _check_eq  CONFIG_HZ                          100
 _check_eq  CONFIG_TRANSPARENT_HUGEPAGE_ALWAYS y
 _check_eq  CONFIG_LTO_CLANG_THIN              y
 
-_check_ym  CONFIG_DRM_I915
 _check_ym  CONFIG_TCP_CONG_BBR
 _check_ym  CONFIG_IWLWIFI
 _check_ym  CONFIG_IWLMVM
@@ -434,11 +467,20 @@ _warn_ym CONFIG_NVME_MULTIPATH
 _warn_ym CONFIG_BLK_WBT
 _warn_ym CONFIG_CHECKPOINT_RESTORE
 _warn_ym CONFIG_INTEL_RAPL
+# NUC 15 Pro / Arrow Lake specific — soft checks (CachyOS base config may vary)
+_warn_ym CONFIG_DRM_XE
+_warn_ym CONFIG_DRM_I915
+_warn_ym CONFIG_IGC
+_warn_ym CONFIG_DRM_ACCEL_IVPU
+_warn_ym CONFIG_IWLMEI
+_warn_ym CONFIG_INTEL_UNCORE_FREQ_CONTROL
+_warn_ym CONFIG_INTEL_SPEED_SELECT_INTERFACE
+_warn_ym CONFIG_NET_SCH_MULTIQ
 
 if [ "$FAILED" -ne 0 ]; then
   echo "aborting: critical config failure"
   grep -E \
-    'CONFIG_HZ=|CONFIG_PREEMPT|CONFIG_LTO|CONFIG_TRANSPARENT_HUGEPAGE|CONFIG_DRM_I915|CONFIG_BBR|CONFIG_IWLWIFI|CONFIG_BPF|CONFIG_DEBUG_INFO_BTF|CONFIG_SCHED_CLASS_EXT|CONFIG_ZSWAP|CONFIG_IOSCHED_ADIOS' \
+    'CONFIG_HZ=|CONFIG_PREEMPT|CONFIG_LTO|CONFIG_TRANSPARENT_HUGEPAGE|CONFIG_DRM_XE|CONFIG_DRM_I915|CONFIG_BBR|CONFIG_IWLWIFI|CONFIG_BPF|CONFIG_DEBUG_INFO_BTF|CONFIG_SCHED_CLASS_EXT|CONFIG_ZSWAP|CONFIG_IOSCHED_ADIOS|CONFIG_IGC' \
     .config || true
   exit 1
 fi
@@ -446,7 +488,7 @@ echo "critical config ok"
 
 msg "config summary"
 grep -E \
-  'CONFIG_HZ=|CONFIG_HZ_100|CONFIG_PREEMPT|CONFIG_CC_IS_CLANG|CONFIG_LTO_CLANG_THIN|CONFIG_TRANSPARENT_HUGEPAGE=|CONFIG_TRANSPARENT_HUGEPAGE_ALWAYS|CONFIG_DEFAULT_TCP_CONG|CONFIG_TCP_CONG_BBR=|CONFIG_DRM_I915=|CONFIG_IWLWIFI=|CONFIG_IWLMVM=|CONFIG_NET_SCH_FQ=|CONFIG_LOCALVERSION|CONFIG_OVERLAY_FS=|CONFIG_VETH=|CONFIG_BRIDGE=|CONFIG_BPF=|CONFIG_BPF_JIT=|CONFIG_DEBUG_INFO_BTF=|CONFIG_SCHED_CLASS_EXT=|CONFIG_ZSWAP=|CONFIG_IOSCHED_ADIOS=|CONFIG_RCU_LAZY=' \
+  'CONFIG_HZ=|CONFIG_HZ_100|CONFIG_PREEMPT|CONFIG_CC_IS_CLANG|CONFIG_LTO_CLANG_THIN|CONFIG_TRANSPARENT_HUGEPAGE=|CONFIG_TRANSPARENT_HUGEPAGE_ALWAYS|CONFIG_DEFAULT_TCP_CONG|CONFIG_TCP_CONG_BBR=|CONFIG_DRM_XE=|CONFIG_DRM_I915=|CONFIG_IGC=|CONFIG_DRM_ACCEL_IVPU=|CONFIG_IWLWIFI=|CONFIG_IWLMVM=|CONFIG_IWLMEI=|CONFIG_NET_SCH_FQ=|CONFIG_LOCALVERSION|CONFIG_OVERLAY_FS=|CONFIG_VETH=|CONFIG_BRIDGE=|CONFIG_BPF=|CONFIG_BPF_JIT=|CONFIG_DEBUG_INFO_BTF=|CONFIG_SCHED_CLASS_EXT=|CONFIG_ZSWAP=|CONFIG_IOSCHED_ADIOS=|CONFIG_RCU_LAZY=|CONFIG_INTEL_UNCORE_FREQ_CONTROL=' \
   .config || true
 
 msg "build"
@@ -496,7 +538,7 @@ PKGREL=${PKGREL}
 CACHY_COMMIT=${CACHY_COMMIT}
 CACHY_VARIANT=${CACHY_VARIANT}
 BUILD_DATE_UTC=$(date -u +%Y-%m-%dT%H:%M:%SZ)
-KERNEL_LOCALVERSION=-cachyos-edge-lenovov15g2-servermax
+KERNEL_LOCALVERSION=-cachyos-edge-nuc15pro-servermax
 SCHEDULER=eevdf-servermax
 SCHED_EXT=compiled-in-scx_bpfland-server-auto-enabled
 CPU_TARGET=x86-64-v3
@@ -514,6 +556,10 @@ NVME_MULTIPATH=enabled
 CGROUP_V2=full
 RCU_LAZY=disabled
 BASE=cachyos-server
+GPU_DRIVER=xe-arc130t-xe2lpg
+ETH_DRIVER=igc-i226v-2500mbps
+NPU=ivpu-ai-boost-13tops
+WIFI=iwlwifi-be201-wifi7
 MANIFEST
 
 cat BUILD_MANIFEST

@@ -1,5 +1,5 @@
 [Unit]
-Description=Check GitHub Releases for Lenovo CachyOS kernel daily at 4 AM
+Description=Check GitHub Releases for NUC 15 Pro CachyOS kernel daily at 4 AM
 
 [Timer]
 OnCalendar=*-*-* 04:00:00
@@ -8,4 +8,3 @@ RandomizedDelaySec=0
 
 [Install]
 WantedBy=timers.target
-

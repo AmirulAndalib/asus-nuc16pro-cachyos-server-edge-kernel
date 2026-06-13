@@ -1,0 +1,12 @@
+[Unit]
+Description=Install latest ASUS NUC 15 Pro CachyOS edge kernel from GitHub Releases
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+Environment=OWNER_REPO=AmirulAndalib/asus-nuc15pro-cachyos-server-edge-kernel
+ExecStart=/usr/local/sbin/nuc15pro-kernel-updater.sh
+
+[Install]
+WantedBy=multi-user.target
