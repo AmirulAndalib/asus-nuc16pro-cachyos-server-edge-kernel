@@ -115,7 +115,7 @@ jobs:
         if: steps.preflight.outputs.skip != 'true'
         uses: rokibhasansagar/slimhub_actions@c2a6e4317d3de2b623ac7395b05e9d2149e8289b  # v25.42.5
         with:
-          retain: "compiler_gcc,docker_buildkit"
+          retain: "compiler_gcc,docker_buildkit,vcs"
 
       - name: Prune Docker image cache
         if: steps.preflight.outputs.skip != 'true'
@@ -188,6 +188,7 @@ jobs:
           restore-keys: |
             ccache-${{ runner.os }}-x86_64v3-
             ccache-${{ runner.os }}-
+          save-always: true
 
       - name: Set up Docker Buildx
         if: steps.preflight.outputs.skip != 'true'
