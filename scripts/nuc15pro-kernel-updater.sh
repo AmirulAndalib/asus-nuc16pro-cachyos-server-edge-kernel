@@ -296,6 +296,10 @@ ExecStart=/bin/sh -c 'for b in /sys/devices/system/cpu/cpu*/power/energy_perf_bi
 ExecStart=/bin/sh -c 'for q in /sys/block/nvme*/queue/nr_requests; do [ -w "$q" ] && printf 1023 > "$q"; done; true'
 # igc (I226-V 2.5GbE): maximize ring buffers for throughput
 ExecStart=/bin/sh -c 'iface=$(ls /sys/class/net/ 2>/dev/null | grep -m1 "^e" || true); [ -n "$iface" ] && ethtool -G "$iface" rx 4096 tx 4096 2>/dev/null || true'
+# Thermal: set x86 package passive trip point to 95C (throttle onset; TjMax for Arrow Lake-H = 105C)
+# Only type=passive trips are touched; type=critical (emergency shutdown) is left untouched.
+# Millidegrees: 95000. Writable unconditionally in kernel 6.14+ (no CONFIG_THERMAL_WRITABLE_TRIPS needed).
+ExecStart=/bin/sh -c 'for zone in /sys/class/thermal/thermal_zone*; do ztype=$(cat "$zone/type" 2>/dev/null || true); [ "$ztype" = "x86_pkg_temp" ] || continue; for i in 0 1; do ttype=$(cat "$zone/trip_point_${i}_type" 2>/dev/null || true); ttemp="$zone/trip_point_${i}_temp"; [ "$ttype" = "passive" ] || continue; [ -w "$ttemp" ] && printf 95000 > "$ttemp" 2>/dev/null && echo "thermal: $ttemp=95000" || true; done; done; true'
 
 [Install]
 WantedBy=multi-user.target
