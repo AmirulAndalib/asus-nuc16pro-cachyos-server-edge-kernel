@@ -180,15 +180,15 @@ jobs:
           fi
 
       - name: Restore ccache
+        id: restore-ccache
         if: steps.preflight.outputs.skip != 'true'
-        uses: actions/cache@27d5ce7f107fe9357f9df03efb73ab90386fccae  # v5.0.5
+        uses: actions/cache/restore@27d5ce7f107fe9357f9df03efb73ab90386fccae  # v5.0.5
         with:
           path: ~/.cache/ccache-cachyos
           key: ccache-${{ runner.os }}-x86_64v3-${{ steps.preflight.outputs.kver }}
           restore-keys: |
             ccache-${{ runner.os }}-x86_64v3-
             ccache-${{ runner.os }}-
-          save-always: true
 
       - name: Set up Docker Buildx
         if: steps.preflight.outputs.skip != 'true'
@@ -298,6 +298,13 @@ jobs:
               echo '```'
             } >> "$GITHUB_STEP_SUMMARY"
           fi
+
+      - name: Save ccache
+        if: always() && steps.preflight.outputs.skip != 'true' && steps.restore-ccache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@27d5ce7f107fe9357f9df03efb73ab90386fccae  # v5.0.5
+        with:
+          path: ~/.cache/ccache-cachyos
+          key: ${{ steps.restore-ccache.outputs.cache-primary-key }}
 
       - name: Upload build artifacts
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a  # v7.0.1
