@@ -8,7 +8,7 @@ upstream CachyOS patchset but *before* the Kconfig fragment merge.
 **Fail-hard.** Any patch in this directory that fails to apply causes the build
 to abort immediately. This is intentional: a partially-patched kernel is worse
 than no custom patch at all. The build script uses `patch -p1 --forward --fuzz=0`
-with `set -euo pipefail` — no retries, no warn-and-continue.
+with `set -euo pipefail`; no retries, no warn-and-continue.
 
 This differs from the CachyOS patchset apply loop (which warns but continues)
 because those patches come from upstream CachyOS and are validated against the
@@ -34,7 +34,7 @@ When the build breaks on a patch apply:
 
 1. Check if the fix was already incorporated upstream (CachyOS or mainline)
 2. Refresh the patch with `git format-patch` against the new base
-3. If context is gone entirely, the kernel already has the fix — delete the patch
+3. If context is gone entirely, the kernel already has the fix; delete the patch
 
 ## Adding a new patch
 
