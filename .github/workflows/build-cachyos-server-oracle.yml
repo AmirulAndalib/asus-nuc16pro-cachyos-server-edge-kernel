@@ -201,7 +201,7 @@ jobs:
             -v "$CCACHE_HOST:/ccache" \
             -w /work \
             -e CCACHE_DIR=/ccache \
-            -e CCACHE_MAXSIZE=5G \
+            -e CCACHE_MAXSIZE=8G \
             -e HOST_UID="$(id -u)" \
             -e HOST_GID="$(id -g)" \
             -e CACHY_VARIANT="linux-cachyos-server" \

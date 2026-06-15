@@ -31,7 +31,14 @@ make --version | head -2 || true
 
 msg "ccache setup"
 export CCACHE_DIR="${CCACHE_DIR:-/ccache}"
-export CCACHE_MAXSIZE="${CCACHE_MAXSIZE:-5G}"
+export CCACHE_MAXSIZE="${CCACHE_MAXSIZE:-8G}"
+# Level 1: fastest compression; ccache objects are already zstd-compressed
+# so outer compression gains little regardless of level.
+export CCACHE_COMPRESSLEVEL="${CCACHE_COMPRESSLEVEL:-1}"
+# time_macros: kernel uses KBUILD_BUILD_TIMESTAMP for reproducibility so
+# __DATE__/__TIME__ macros are already neutralised.
+# locale: no locale-dependent output from clang for kernel builds.
+export CCACHE_SLOPPINESS="${CCACHE_SLOPPINESS:-time_macros,locale}"
 export CCACHE_COMPILERCHECK=content
 ccache --zero-stats || true
 ccache -s           || true
@@ -138,6 +145,11 @@ fi
 
 echo "source: $LINUX_SRC"
 cd "$LINUX_SRC"
+# Normalise the version-specific directory prefix out of ccache hash keys so
+# objects from linux-7.0.11 are reused for linux-7.0.12 when source is identical.
+# Without this every kernel version bump = 0% cache hits because the source path
+# embeds the version (e.g. /work/build/linux-7.0.12/...).
+export CCACHE_BASEDIR="$LINUX_SRC"
 
 msg "applying cachyos patches"
 PATCH_FAIL=0
