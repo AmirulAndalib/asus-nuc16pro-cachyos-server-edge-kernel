@@ -561,9 +561,9 @@ systemctl status scx_loader.service --no-pager -l | head -30 2>/dev/null || true
 # RAPL power limits readback: confirm BIOS didn't lock/override our writes
 if [ -d /sys/class/powercap/intel-rapl/intel-rapl:0 ]; then
   p=/sys/class/powercap/intel-rapl/intel-rapl:0
-  echo "rapl pl1:   $(cat $p/constraint_0_power_limit_uw)uW"
-  echo "rapl pl2:   $(cat $p/constraint_1_power_limit_uw)uW"
-  echo "rapl tw:    $(cat $p/constraint_1_time_window_us)us"
+  echo "rapl pl1:   $(cat "$p/constraint_0_power_limit_uw")uW"
+  echo "rapl pl2:   $(cat "$p/constraint_1_power_limit_uw")uW"
+  echo "rapl tw:    $(cat "$p/constraint_1_time_window_us")us"
 else
   echo "rapl:       sysfs not available (CONFIG_POWERCAP/INTEL_RAPL_CORE not loaded?)"
 fi

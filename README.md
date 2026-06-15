@@ -70,23 +70,51 @@ Arrow Lake-H has 4P (Lion Cove) + 8E (Skymont) + 2LP-E (Crestmont) cores with In
 
 ## Pipeline
 
-Builds on GitHub Actions `ubuntu-latest` (4 vCPU / 16 GB RAM, native x86-64). No cross-compilation — clang targets the host directly.
+Two independent build paths produce identical `.deb` packages. The Oracle A1 workflow runs 12 hours after GHA as a fallback. If GHA already built successfully, Oracle's pre-flight check finds the release and skips.
 
 ```text
-GHA ubuntu-latest (native x86-64) -> clang -march=x86-64-v3 -> .deb (amd64)
+GHA ubuntu-latest (native x86-64, daily 09:00 UTC)
+  -> make ARCH=x86_64 LLVM=1 LLVM_IAS=1 CC="ccache clang"
+  -> KCFLAGS="-march=x86-64-v3" KBUILD_DEBARCH=amd64
+  -> .deb (amd64)
+
+Oracle A1 self-hosted (ARM64, daily 21:00 UTC, 12 h after GHA)
+  -> make ARCH=x86_64 LLVM=1 LLVM_IAS=1 CC="ccache clang"
+     (clang is a cross-compiler; no CROSS_COMPILE= needed with LLVM=1)
+  -> KCFLAGS="-march=x86-64-v3" KBUILD_DEBARCH=amd64
+  -> .deb (amd64)
 ```
 
-Schedule: daily at 09:00 UTC. Pre-flight check compares upstream `pkgver` against recent releases; **skips the build if the kernel version already exists** (no duplicate releases). On skip, only checkout and pre-flight run — disk cleanup and the full build are skipped entirely.
+Both workflows run a pre-flight check that compares upstream `pkgver` against recent releases. If the version already exists, the build is skipped entirely; only checkout and pre-flight run.
 
 ### Caching
 
-- **Docker BuildX**: builder image layers cached in GHA cache (`type=gha`) — warm builds reuse the cached image and skip the ~5-minute package install
-- **ccache**: compiler cache persisted via `actions/cache` (5 GB, keyed on kernel version) — incremental rebuilds skip unchanged translation units
+**GHA workflow** (`build-cachyos-server.yml`):
+- **Docker Buildx**: builder image layers cached in GHA cache (`type=gha`); warm builds skip the ~5-minute package install
+- **ccache**: 8 GB, persisted via `actions/cache`, keyed on kernel version (`ccache-Linux-x86_64v3-{kver}`); incremental rebuilds skip unchanged translation units
+
+**Oracle A1 workflow** (`build-cachyos-server-oracle.yml`):
+- **Docker**: plain `docker build --pull`; the persistent self-hosted runner keeps Docker's own layer cache between runs, no GHA cache used
+- **ccache**: 8 GB, persisted via `actions/cache`, keyed separately (`ccache-Linux-aarch64-cross-x86_64v3-{kver}`); separate from the GHA cache bucket
 
 ### Build environment
 
-- Disk: `rokibhasansagar/slimhub_actions` frees ~40-60 GB before build (browsers, Java, Android SDK removed)
-- Swap: 32 GB swapfile on `/mnt` (separate SSD) prevents OOM during the BTF+ThinLTO peak
+| | GHA `ubuntu-latest` | Oracle A1 self-hosted |
+|---|---|---|
+| Architecture | x86-64 (native) | ARM64 -> x86-64 (cross) |
+| Disk free | `slimhub_actions` (~40-60 GB freed) | Persistent runner, manual cleanup |
+| Swap | 32 GB on `/mnt` | 16 GB on `/mnt` |
+| Docker cache | Buildx GHA cache | Local layer cache (persistent) |
+| Timeout | 360 min | 480 min |
+
+The BTF+ThinLTO peak can spike past available RAM during linking; swap prevents OOM-kill. Oracle A1 uses 16 GB because cross-compile peak is lower than native ThinLTO on x86.
+
+### Boot test
+
+After building, each workflow checks the kernel. On failure the build stops and no release is created.
+
+- **GHA**: boots the kernel in `qemu-system-x86_64` with KVM. A minimal busybox initramfs runs as init, prints `BOOT_TEST_SUCCESS`, and poweroffs. KVM is available on GHA `ubuntu-latest` runners with no extra setup.
+- **Oracle A1**: no boot test. QEMU TCG emulation of x86-64 on ARM64 takes 20-30 minutes per boot, too slow for CI. Instead, the .deb contents are validated (vmlinuz present, modules tree present, arch=amd64). GHA validates boot correctness before Oracle runs.
 
 ### Release assets
 
@@ -271,7 +299,11 @@ cat /sys/firmware/acpi/platform_profile_choices
 
 ## Manual Build
 
-GitHub Actions → **Build ASUS NUC 15 Pro CachyOS ServerMax Kernel** → **Run workflow**.
+To trigger the GHA workflow: GitHub Actions → **Build ASUS NUC 15 Pro CachyOS ServerMax Kernel** → **Run workflow**.
+
+To trigger the Oracle A1 cross-compile fallback: GitHub Actions → **Build ASUS NUC 15 Pro CachyOS ServerMax Kernel (Oracle A1 ARM64 cross)** → **Run workflow**.
+
+Both workflows accept a `force` input (`true`) to bypass the version pre-flight check and rebuild even if a release for the current kernel version already exists.
 
 ## Manual Install
 

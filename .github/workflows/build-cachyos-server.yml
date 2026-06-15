@@ -299,6 +299,29 @@ jobs:
             } >> "$GITHUB_STEP_SUMMARY"
           fi
 
+      - name: Boot test (QEMU/KVM)
+        if: steps.preflight.outputs.skip != 'true'
+        run: |
+          set -euo pipefail
+          sudo apt-get install -y qemu-system-x86 busybox-static >/dev/null
+
+          chmod +x scripts/test-kernel-boot.sh
+          scripts/test-kernel-boot.sh dist/
+
+          {
+            echo "## Boot test"
+            echo "Kernel booted successfully in QEMU/KVM (BOOT_TEST_SUCCESS)."
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Boot test diagnostics on failure
+        if: failure() && steps.preflight.outputs.skip != 'true'
+        run: |
+          {
+            echo "## Boot test FAILED"
+            echo "Kernel did not produce BOOT_TEST_SUCCESS in QEMU/KVM within 180 s."
+            echo "Check the boot output above for kernel panic or hung init."
+          } >> "$GITHUB_STEP_SUMMARY"
+
       - name: Save ccache
         if: always() && steps.preflight.outputs.skip != 'true' && steps.restore-ccache.outputs.cache-hit != 'true'
         uses: actions/cache/save@27d5ce7f107fe9357f9df03efb73ab90386fccae  # v5.0.5

@@ -10,7 +10,7 @@ on:
         type: choice
         options: ['false', 'true']
   schedule:
-    # 9pm UTC daily — 12h after GHA build starts; GHA either succeeded (pre-flight skips)
+    # 9pm UTC daily, 12h after GHA build starts. GHA either succeeded (pre-flight skips)
     # or failed (Oracle builds and releases as fallback).
     - cron: "0 21 * * *"
 
@@ -275,6 +275,40 @@ jobs:
               echo '```'
             } >> "$GITHUB_STEP_SUMMARY"
           fi
+
+      - name: Package content validation
+        # Boot test is skipped on Oracle A1: this runner is ARM64 and can only emulate
+        # x86-64 via QEMU TCG (software), which takes 20-30 min per boot. The GHA
+        # workflow runs 12 h earlier and validates boot correctness with KVM acceleration.
+        # Instead, validate .deb contents to catch packaging errors (missing vmlinuz,
+        # wrong arch, empty modules) without a full boot.
+        if: steps.preflight.outputs.skip != 'true'
+        run: |
+          set -euo pipefail
+
+          IMG_DEB="$(find dist/ -maxdepth 1 -name 'linux-image-*.deb' ! -name '*-dbg_*' | head -1)"
+          HDR_DEB="$(find dist/ -maxdepth 1 -name 'linux-headers-*.deb' | head -1)"
+
+          echo "=== linux-image contents (first 30 entries) ==="
+          dpkg -c "$IMG_DEB" | head -30
+
+          dpkg -c "$IMG_DEB" | grep -q '/boot/vmlinuz-' || \
+            { echo "error: vmlinuz missing from $IMG_DEB"; exit 1; }
+          dpkg -c "$IMG_DEB" | grep -q '/lib/modules/'  || \
+            { echo "error: modules tree missing from $IMG_DEB"; exit 1; }
+          dpkg -c "$HDR_DEB" | grep -q '/usr/src/'       || \
+            { echo "error: headers missing from $HDR_DEB"; exit 1; }
+
+          ARCH="$(dpkg --info "$IMG_DEB" | awk '/Architecture:/ {print $2}')"
+          [ "$ARCH" = "amd64" ] || { echo "error: unexpected arch: $ARCH"; exit 1; }
+
+          echo "package content: ok (vmlinuz + modules + headers present, arch=$ARCH)"
+
+          {
+            echo "## Package content validation"
+            echo "vmlinuz, modules, and headers confirmed present in .deb archives (arch=amd64)."
+            echo "> Boot test skipped on Oracle A1: QEMU TCG x86-64 emulation on ARM64 takes 20-30 min per boot; GHA validates boot correctness via KVM."
+          } >> "$GITHUB_STEP_SUMMARY"
 
       - name: Save ccache
         if: always() && steps.preflight.outputs.skip != 'true' && steps.restore-ccache.outputs.cache-hit != 'true'
