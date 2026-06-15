@@ -1,0 +1,378 @@
+name: Build ASUS NUC 15 Pro CachyOS ServerMax Kernel (Oracle A1 ARM64 cross)
+
+on:
+  workflow_dispatch:
+    inputs:
+      force:
+        description: 'Force build even if version already released (use after repo transitions)'
+        required: false
+        default: 'false'
+        type: choice
+        options: ['false', 'true']
+  schedule:
+    # 9pm UTC daily — 12h after GHA build starts; GHA either succeeded (pre-flight skips)
+    # or failed (Oracle builds and releases as fallback).
+    - cron: "0 21 * * *"
+
+permissions:
+  contents: write
+
+env:
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+
+concurrency:
+  group: asus-nuc15pro-cachyos-servermax-kernel-oracle
+  cancel-in-progress: false
+
+jobs:
+  build:
+    name: Build CachyOS ServerMax kernel, cross-compile ARM64→amd64 on Oracle A1
+    runs-on: [self-hosted, oracle-a1]
+    timeout-minutes: 480
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10  # v6.0.3
+
+      - name: Show runner info
+        run: |
+          uname -a
+          lscpu | head -80 || true
+          df -h
+          free -h
+          docker version
+          {
+            echo "## Runner (Oracle A1 ARM64 cross-compile)"
+            echo '```'
+            uname -a
+            lscpu | head -80 || true
+            df -h
+            free -h
+            docker version 2>&1 || true
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Pre-flight - skip if kernel version already released
+        id: preflight
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+
+          # CACHY_TMPDIR not TMPDIR - avoids clobbering the $TMPDIR stdlib env var
+          CACHY_TMPDIR="$(mktemp -d)"
+          git clone --depth=1 --quiet \
+            https://github.com/CachyOS/linux-cachyos.git "$CACHY_TMPDIR"
+
+          VARIANT="linux-cachyos-server"
+          if [ ! -d "$CACHY_TMPDIR/$VARIANT" ]; then
+            VARIANT="linux-cachyos"
+          fi
+
+          KVER="$(bash -c "
+            cd '$CACHY_TMPDIR/$VARIANT'
+            prepare(){ true; }; build(){ true; }; package(){ true; }
+            source PKGBUILD 2>/dev/null || true
+            printf '%s' \"\${pkgver:-}\"
+          " 2>/dev/null | tr -d $'\n')"
+
+          CACHY_COMMIT="$(git -C "$CACHY_TMPDIR" rev-parse --short HEAD || true)"
+          rm -rf "$CACHY_TMPDIR"
+
+          echo "Upstream pkgver: $KVER"
+          echo "CachyOS commit:  $CACHY_COMMIT"
+          echo "kver=$KVER"                     >> "$GITHUB_OUTPUT"
+          echo "cachy_commit=$CACHY_COMMIT"     >> "$GITHUB_OUTPUT"
+
+          if [ -z "$KVER" ]; then
+            echo "Could not read upstream version - proceeding with build"
+            echo "skip=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          # Check 50 most recent releases for servermax tag
+          RECENT="$(gh release list \
+            --repo "${{ github.repository }}" \
+            --limit 50 \
+            --json tagName \
+            --jq '.[].tagName' 2>/dev/null || true)"
+
+          FORCE_BUILD="${{ github.event.inputs.force }}"
+          if [ "$FORCE_BUILD" = "true" ]; then
+            echo "FORCE: skipping version check, building regardless"
+            echo "skip=false" >> "$GITHUB_OUTPUT"
+          elif echo "$RECENT" | grep -q "v${KVER}-cachyos-servermax-x86_64v3-"; then
+            echo "SKIP: $KVER already has a servermax release."
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+            {
+              echo "### Skipped - already built"
+              echo "Upstream \`$KVER\` already present in servermax releases."
+            } >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo "BUILD: $KVER not yet released as servermax"
+            echo "skip=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Prune Docker image cache
+        if: steps.preflight.outputs.skip != 'true'
+        run: docker image prune -af
+
+      - name: Free memory and ensure swap
+        if: steps.preflight.outputs.skip != 'true'
+        run: |
+          set -uo pipefail
+
+          echo "== before =="
+          free -h || true
+          swapon --show || true
+
+          sudo sync || true
+          echo 3 | sudo tee /proc/sys/vm/drop_caches >/dev/null || true
+
+          # ThinLTO link + pahole BTF spike needs swap headroom on Oracle A1 too.
+          if [ -z "$(swapon --show=NAME --noheadings)" ]; then
+            SWAPFILE="/mnt/swapfile-cachyos-build"
+            # 16 GB: cross-compile peak RAM is lower than native ThinLTO on x86,
+            # but pahole processing the x86-64 DWARF still spikes significantly.
+            SWAP_GB=16
+            echo "no active swap - creating ${SWAP_GB}G at ${SWAPFILE}"
+            if [ ! -f "$SWAPFILE" ]; then
+              sudo fallocate -l "${SWAP_GB}G" "$SWAPFILE" \
+                || sudo dd if=/dev/zero of="$SWAPFILE" bs=1M count=$((SWAP_GB * 1024)) status=none
+              sudo chmod 600 "$SWAPFILE"
+              sudo mkswap "$SWAPFILE"
+            fi
+            if ! sudo swapon "$SWAPFILE"; then
+              echo "swapon rejected the file - rebuilding hole-free with dd"
+              sudo swapoff "$SWAPFILE" 2>/dev/null || true
+              sudo rm -f "$SWAPFILE"
+              sudo dd if=/dev/zero of="$SWAPFILE" bs=1M count=$((SWAP_GB * 1024)) status=none
+              sudo chmod 600 "$SWAPFILE"
+              sudo mkswap "$SWAPFILE"
+              sudo swapon "$SWAPFILE"
+            fi
+          else
+            echo "swap already active - leaving as-is"
+          fi
+
+          echo "== after =="
+          free -h || true
+          swapon --show || true
+          df -h / || true
+
+          if [ -z "$(swapon --show=NAME --noheadings)" ]; then
+            echo "error: no active swap after setup - build would likely OOM" >&2
+            exit 1
+          fi
+
+      - name: Restore ccache
+        id: restore-ccache
+        if: steps.preflight.outputs.skip != 'true'
+        uses: actions/cache/restore@27d5ce7f107fe9357f9df03efb73ab90386fccae  # v5.0.5
+        with:
+          path: ~/.cache/ccache-cachyos
+          key: ccache-${{ runner.os }}-aarch64-cross-x86_64v3-${{ steps.preflight.outputs.kver }}
+          restore-keys: |
+            ccache-${{ runner.os }}-aarch64-cross-x86_64v3-
+            ccache-${{ runner.os }}-aarch64-
+
+      - name: Build builder image
+        if: steps.preflight.outputs.skip != 'true'
+        # Plain docker build (no Buildx/GHA layer cache) - Docker's own layer
+        # cache on the persistent Oracle runner is sufficient for incremental rebuilds.
+        run: docker build --pull -t cachyos-builder:latest -f Dockerfile.builder .
+
+      - name: Build kernel
+        if: steps.preflight.outputs.skip != 'true'
+        run: |
+          chmod +x scripts/build-cachyos-server.sh
+          mkdir -p dist
+
+          CCACHE_HOST="$HOME/.cache/ccache-cachyos"
+          mkdir -p "$CCACHE_HOST"
+
+          # ARM64 Docker container; ARCH=x86_64 LLVM=1 LLVM_IAS=1 makes clang
+          # cross-compile to x86-64 without CROSS_COMPILE= (LLVM is already a
+          # cross-compiler). Output debs are amd64 (KBUILD_DEBARCH=amd64 in script).
+          docker run --rm \
+            --shm-size=4g \
+            --ulimit nofile=1048576:1048576 \
+            -v "$PWD:/work" \
+            -v "$CCACHE_HOST:/ccache" \
+            -w /work \
+            -e CCACHE_DIR=/ccache \
+            -e CCACHE_MAXSIZE=5G \
+            -e HOST_UID="$(id -u)" \
+            -e HOST_GID="$(id -g)" \
+            -e CACHY_VARIANT="linux-cachyos-server" \
+            cachyos-builder:latest \
+            bash /work/scripts/build-cachyos-server.sh
+
+      - name: Diagnostics on failure
+        if: failure() && steps.preflight.outputs.skip != 'true'
+        run: |
+          echo "== memory / swap =="
+          free -h || true
+          swapon --show || true
+
+          echo "== kernel OOM messages =="
+          { sudo dmesg 2>/dev/null || dmesg 2>/dev/null || true; } \
+            | grep -iE 'out of memory|killed process|oom-kill' | tail -40 || true
+
+          echo "== disk =="
+          df -h || true
+
+          echo "== containers =="
+          docker ps -a || true
+
+          {
+            echo "### Build failed - diagnostics"
+            echo '```'
+            free -h 2>&1 || true
+            swapon --show 2>&1 || true
+            { sudo dmesg 2>/dev/null || dmesg 2>/dev/null || true; } \
+              | grep -iE 'out of memory|killed process|oom-kill' | tail -20 || true
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Verify release assets
+        if: steps.preflight.outputs.skip != 'true'
+        run: |
+          set -euo pipefail
+
+          ls -lh dist/
+          test -f dist/SHA256SUMS
+          test -f dist/BUILD_MANIFEST
+          test "$(find dist -name 'linux-image-*.deb'   | wc -l)" -ge 1
+          test "$(find dist -name 'linux-headers-*.deb' | wc -l)" -ge 1
+
+          echo "Verifying .deb integrity ..."
+          for deb in dist/*.deb; do
+            dpkg --info "$deb" >/dev/null
+          done
+
+          {
+            echo "## Built packages"
+            echo '```'
+            ls -lh dist/
+            echo '```'
+            echo "**Build manifest:**"
+            echo '```'
+            cat dist/BUILD_MANIFEST
+            echo '```'
+            echo "**SHA-256 checksums:**"
+            echo '```'
+            cat dist/SHA256SUMS
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+          CCACHE_HOST="$HOME/.cache/ccache-cachyos"
+          if [ -d "$CCACHE_HOST" ]; then
+            {
+              echo "**ccache stats:**"
+              echo '```'
+              CCACHE_DIR="$CCACHE_HOST" ccache -s 2>/dev/null || true
+              echo '```'
+            } >> "$GITHUB_STEP_SUMMARY"
+          fi
+
+      - name: Save ccache
+        if: always() && steps.preflight.outputs.skip != 'true' && steps.restore-ccache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@27d5ce7f107fe9357f9df03efb73ab90386fccae  # v5.0.5
+        with:
+          path: ~/.cache/ccache-cachyos
+          key: ${{ steps.restore-ccache.outputs.cache-primary-key }}
+
+      - name: Upload build artifacts
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a  # v7.0.1
+        if: always() && steps.preflight.outputs.skip != 'true'
+        with:
+          name: cachyos-servermax-oracle-debs-run${{ github.run_number }}-${{ github.run_attempt }}
+          path: dist/
+          retention-days: 7
+
+      - name: Create GitHub Release
+        if: steps.preflight.outputs.skip != 'true'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+
+          source dist/BUILD_MANIFEST
+
+          BUILD_DATE="$(date -u +%Y-%m-%d)"
+          BUILD_DATE_NODASH="$(date -u +%Y%m%d)"
+          CHECKSUMS="$(cat dist/SHA256SUMS)"
+
+          TAG="v${KERNEL_VERSION}-cachyos-servermax-x86_64v3-${BUILD_DATE_NODASH}.${GITHUB_RUN_NUMBER}"
+          TITLE="Linux ${KERNEL_VERSION} • CachyOS ServerMax • ASUS NUC 15 Pro • ${BUILD_DATE}"
+
+          PRERELEASE_OPTS=()
+          echo "$KERNEL_VERSION" | grep -qi 'rc' && PRERELEASE_OPTS+=(--prerelease)
+
+          cat > /tmp/release-notes.md << NOTES_EOF
+          ## Linux ${KERNEL_VERSION}, CachyOS ServerMax
+
+          AC-powered, full-throughput CachyOS ServerMax kernel for **ASUS NUC 15 Pro** with Intel Core Ultra 5 225H / Arrow Lake-H.
+
+          ### Build Configuration
+
+          - Kernel version: \`${KERNEL_VERSION}${KERNEL_LOCALVERSION}\`
+          - CachyOS variant: \`${CACHY_VARIANT}\`
+          - Scheduler base: \`${SCHEDULER}\`
+          - sched_ext support: \`${SCHED_EXT}\`
+          - Compiler: LLVM / Clang \`${CLANG_VERSION}\` + LLD \`${LLD_VERSION}\`
+          - LTO: \`${LTO}\`
+          - CPU target: \`${CPU_TARGET}\`
+          - Timer frequency: \`${TIMER_HZ} Hz\`
+          - Preemption model: \`${PREEMPT}\`
+          - THP: \`${THP}\`
+          - Zswap: \`${ZSWAP}\`
+          - I/O scheduler: \`${IO_SCHEDULER}\`
+          - CPU policy: \`${CPU_POLICY}\`
+          - RCU lazy: \`${RCU_LAZY}\`
+
+          ### Runtime Defaults
+
+          - CPU governor: \`performance\`
+          - Intel EPP: \`performance\`
+          - GPU driver: \`xe\` (Intel Arc 130T Xe2-LPG, GuC auto-enabled)
+          - SCX server scheduler: \`scx_bpfland -s 20000 -S\`
+          - zswap: \`zstd\`, \`z3fold\`, \`20%\`
+          - TCP: \`bbr\` + \`fq\`
+
+          ### SHA-256 Checksums
+
+          \`\`\`
+          ${CHECKSUMS}
+          \`\`\`
+
+          ### Provenance
+
+          - Build timestamp: \`${BUILD_DATE_UTC}\`
+          - linux-cachyos commit: \`${CACHY_COMMIT}\`
+          - Workflow run: ${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}
+          - Builder: Oracle A1 ARM64 self-hosted (cross-compile ARM64→amd64, Docker container)
+          - Output: Debian/Ubuntu amd64 \`.deb\` packages
+          NOTES_EOF
+
+          gh release create "$TAG" \
+            dist/*.deb dist/SHA256SUMS dist/BUILD_MANIFEST \
+            --title "$TITLE" \
+            "${PRERELEASE_OPTS[@]}" \
+            --notes-file /tmp/release-notes.md
+
+          RELEASE_URL="${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/releases/tag/${TAG}"
+          {
+            echo "## Release created"
+            echo ""
+            echo "$RELEASE_URL"
+            echo ""
+            echo "| Field | Value |"
+            echo "|-------|-------|"
+            echo "| Tag | \`$TAG\` |"
+            echo "| Kernel | \`$KERNEL_VERSION\` |"
+            echo "| Clang | \`$CLANG_VERSION\` |"
+            echo "| LLD | \`$LLD_VERSION\` |"
+            echo "| linux-cachyos | \`$CACHY_COMMIT\` |"
+          } >> "$GITHUB_STEP_SUMMARY"
