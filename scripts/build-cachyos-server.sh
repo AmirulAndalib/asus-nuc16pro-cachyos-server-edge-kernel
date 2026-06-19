@@ -367,7 +367,7 @@ GPU_DRIVER=xe-pantherlake-xe3lp
 ETH_DRIVER=igc-i226v-2500mbps
 NPU=ivpu-pantherlake-50tops
 WIFI=iwlwifi-be211-wifi7
-POWER_LIMITS=rapl-pl1-80w-pl2-80w-60s
+POWER_LIMITS=rapl-pl1-104w-pl2-104w-224s
 PLATFORM_PROFILE=performance
 USB_AUTOSUSPEND=disabled
 MANIFEST

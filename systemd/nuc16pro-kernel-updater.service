@@ -5,7 +5,7 @@ Wants=network-online.target
 
 [Service]
 Type=oneshot
-Environment=OWNER_REPO=AmirulAndalib/asus-nuc15pro-cachyos-server-edge-kernel
+Environment=OWNER_REPO=AmirulAndalib/asus-nuc16pro-cachyos-server-edge-kernel
 ExecStart=/usr/local/sbin/nuc16pro-kernel-updater.sh
 
 [Install]

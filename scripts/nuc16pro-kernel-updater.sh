@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-OWNER_REPO="${OWNER_REPO:-AmirulAndalib/asus-nuc15pro-cachyos-server-edge-kernel}"
+OWNER_REPO="${OWNER_REPO:-AmirulAndalib/asus-nuc16pro-cachyos-server-edge-kernel}"
 
 STATE_DIR="/var/lib/nuc16pro-kernel-updater"
 LOG_DIR="/var/log/nuc16pro-kernel-updater"
@@ -273,6 +273,9 @@ SERVICE
 
 systemctl daemon-reload
 systemctl enable nuc16pro-servermax-cpupower.service || true
+# restart, not just enable: RemainAfterExit=yes means an already-active oneshot
+# won't re-run ExecStart just because the unit file changed underneath it
+systemctl restart nuc16pro-servermax-cpupower.service || true
 
 # Runtime power tuning: RAPL PL1/PL2, platform profile, energy_perf_bias, NVMe queue depth, igc rings
 install -Dm644 /dev/stdin /etc/systemd/system/nuc16pro-servermax-power.service <<'POWER_SVC'
@@ -285,12 +288,14 @@ Type=oneshot
 RemainAfterExit=yes
 # ACPI platform profile: request performance fan curve from EC/BIOS
 ExecStart=/bin/sh -c '[ -f /sys/firmware/acpi/platform_profile ] && echo performance > /sys/firmware/acpi/platform_profile || true'
-# Intel RAPL on 120W AC: PL1=80W sustained, PL2=80W (MTP = max turbo power for 356H)
-# Setting PL1=PL2=MTP removes the sustained/burst distinction for max continuous performance.
+# Intel RAPL on 120W AC: PL1=104W, PL2=104W, Tau=224s (BIOS-unlocked ceiling, matches firmware Power Limit 1/2 + Time Window)
+# Setting PL1=PL2 removes the sustained/burst distinction for max continuous performance.
+# 104W package + iGPU/NPU/board draw stays under the 120W adapter; sustained ceiling is bounded by cooling, not the OS.
 # BIOS may lock the MSR; read back actual value after write to confirm.
-ExecStart=/bin/sh -c 'p=/sys/class/powercap/intel-rapl/intel-rapl:0; [ -d "$p" ] && printf 80000000 > "$p/constraint_0_power_limit_uw" && echo "RAPL PL1=$(cat $p/constraint_0_power_limit_uw)uW" || true'
-ExecStart=/bin/sh -c 'p=/sys/class/powercap/intel-rapl/intel-rapl:0; [ -d "$p" ] && printf 80000000 > "$p/constraint_1_power_limit_uw" && echo "RAPL PL2=$(cat $p/constraint_1_power_limit_uw)uW" || true'
-ExecStart=/bin/sh -c 'p=/sys/class/powercap/intel-rapl/intel-rapl:0; [ -d "$p" ] && printf 60000000 > "$p/constraint_1_time_window_us" || true'
+ExecStart=/bin/sh -c 'p=/sys/class/powercap/intel-rapl/intel-rapl:0; [ -d "$p" ] && printf 104000000 > "$p/constraint_0_power_limit_uw" && echo "RAPL PL1=$(cat $p/constraint_0_power_limit_uw)uW" || true'
+ExecStart=/bin/sh -c 'p=/sys/class/powercap/intel-rapl/intel-rapl:0; [ -d "$p" ] && printf 104000000 > "$p/constraint_1_power_limit_uw" && echo "RAPL PL2=$(cat $p/constraint_1_power_limit_uw)uW" || true'
+ExecStart=/bin/sh -c 'p=/sys/class/powercap/intel-rapl/intel-rapl:0; [ -d "$p" ] && printf 224000000 > "$p/constraint_0_time_window_us" || true'
+ExecStart=/bin/sh -c 'p=/sys/class/powercap/intel-rapl/intel-rapl:0; [ -d "$p" ] && printf 224000000 > "$p/constraint_1_time_window_us" || true'
 # energy_perf_bias=0: no microarchitecture power-saving bias on any core
 ExecStart=/bin/sh -c 'for b in /sys/devices/system/cpu/cpu*/power/energy_perf_bias; do [ -w "$b" ] && printf 0 > "$b"; done; true'
 # NVMe: maximize request queue depth per namespace for Gen4/Gen5 throughput
@@ -309,6 +314,11 @@ POWER_SVC
 
 systemctl daemon-reload
 systemctl enable nuc16pro-servermax-power.service || true
+# restart, not just enable: RemainAfterExit=yes means an already-active oneshot
+# won't re-run ExecStart just because the unit file changed underneath it.
+# This is what actually pushes a wattage/Tau change live on a machine that's
+# already on the target kernel (no kernel change -> no reboot -> service never re-fires).
+systemctl restart nuc16pro-servermax-power.service || true
 
 msg "installing sched_ext schedulers"
 
@@ -565,7 +575,8 @@ if [ -d /sys/class/powercap/intel-rapl/intel-rapl:0 ]; then
   p=/sys/class/powercap/intel-rapl/intel-rapl:0
   echo "rapl pl1:   $(cat "$p/constraint_0_power_limit_uw")uW"
   echo "rapl pl2:   $(cat "$p/constraint_1_power_limit_uw")uW"
-  echo "rapl tw:    $(cat "$p/constraint_1_time_window_us")us"
+  echo "rapl tau1:  $(cat "$p/constraint_0_time_window_us")us"
+  echo "rapl tau2:  $(cat "$p/constraint_1_time_window_us")us"
 else
   echo "rapl:       sysfs not available (CONFIG_POWERCAP/INTEL_RAPL_CORE not loaded?)"
 fi

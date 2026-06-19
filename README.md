@@ -52,7 +52,7 @@ Tracks `linux-cachyos-server`, CachyOS stable server variant with server-optimiz
 | RCU lazy               | Disabled (AC-only, no power-saving bias)                                     |
 | BTF                    | Enabled (`/sys/kernel/btf/vmlinux` for scx tools)                           |
 | Debug info             | DWARF (toolchain default), required for BTF                                  |
-| CPU power limits       | RAPL PL1=80W, PL2=80W (MTP), 60s window (120W AC adapter)                   |
+| CPU power limits       | RAPL PL1=104W, PL2=104W, Tau=224s (BIOS-unlocked, 120W AC adapter)          |
 | Fan control            | ACPI platform profile: `performance`; ASUS WMI EC interface                  |
 | USB autosuspend        | Disabled (`usbcore.autosuspend=-1`): full power all ports                    |
 | WiFi power save        | Disabled (`iwlwifi power_save=0`, `iwlmvm power_scheme=1`)                   |
@@ -140,7 +140,7 @@ Run as root on the NUC. Downloads, installs, and enables the auto-updater in one
 
 ```bash
 sudo bash -c '
-  BASE=https://raw.githubusercontent.com/AmirulAndalib/asus-nuc15pro-cachyos-server-edge-kernel/refs/heads/master
+  BASE=https://raw.githubusercontent.com/AmirulAndalib/asus-nuc16pro-cachyos-server-edge-kernel/refs/heads/master
   wget -qO /usr/local/sbin/nuc16pro-kernel-updater.sh         "$BASE/scripts/nuc16pro-kernel-updater.sh"
   wget -qO /etc/systemd/system/nuc16pro-kernel-updater.service "$BASE/systemd/nuc16pro-kernel-updater.service"
   wget -qO /etc/systemd/system/nuc16pro-kernel-updater.timer   "$BASE/systemd/nuc16pro-kernel-updater.timer"
@@ -155,7 +155,7 @@ Or with `curl` if `wget` is unavailable:
 
 ```bash
 sudo bash -c '
-  BASE=https://raw.githubusercontent.com/AmirulAndalib/asus-nuc15pro-cachyos-server-edge-kernel/refs/heads/master
+  BASE=https://raw.githubusercontent.com/AmirulAndalib/asus-nuc16pro-cachyos-server-edge-kernel/refs/heads/master
   curl -fsSLo /usr/local/sbin/nuc16pro-kernel-updater.sh         "$BASE/scripts/nuc16pro-kernel-updater.sh"
   curl -fsSLo /etc/systemd/system/nuc16pro-kernel-updater.service "$BASE/systemd/nuc16pro-kernel-updater.service"
   curl -fsSLo /etc/systemd/system/nuc16pro-kernel-updater.timer   "$BASE/systemd/nuc16pro-kernel-updater.timer"
@@ -181,7 +181,7 @@ See [What the installer does automatically](#3-what-the-installer-does-automatic
 ### 1. Clone and set OWNER_REPO
 
 ```bash
-git clone https://github.com/AmirulAndalib/asus-nuc15pro-cachyos-server-edge-kernel.git
+git clone https://github.com/AmirulAndalib/asus-nuc16pro-cachyos-server-edge-kernel.git
 ```
 
 Set your repo in two places:
@@ -189,13 +189,13 @@ Set your repo in two places:
 **`scripts/nuc16pro-kernel-updater.sh`** line 4:
 
 ```bash
-OWNER_REPO="${OWNER_REPO:-AmirulAndalib/asus-nuc15pro-cachyos-server-edge-kernel}"
+OWNER_REPO="${OWNER_REPO:-AmirulAndalib/asus-nuc16pro-cachyos-server-edge-kernel}"
 ```
 
 **`systemd/nuc16pro-kernel-updater.service`** Environment line:
 
 ```ini
-Environment=OWNER_REPO=AmirulAndalib/asus-nuc15pro-cachyos-server-edge-kernel
+Environment=OWNER_REPO=AmirulAndalib/asus-nuc16pro-cachyos-server-edge-kernel
 ```
 
 ### 2. Install the auto-updater on the NUC
@@ -227,7 +227,7 @@ On first run and each new release, the installer handles everything without manu
 - Writes `/etc/sysctl.d/99-nuc16pro-servermax.conf` (BBR+FQ, large buffers, inotify, vm tuning, `rp_filter=2` for dual NIC)
 - Writes `/etc/udev/rules.d/60-nuc16pro-ioschedulers.rules` (ADIOS for SSDs/NVMe, BFQ for HDDs)
 - Installs and enables `/etc/systemd/system/nuc16pro-servermax-cpupower.service` (performance governor + EPP for all P/E/LP-E cores)
-- Installs and enables `/etc/systemd/system/nuc16pro-servermax-power.service` (RAPL PL1=80W, PL2=80W MTP, platform profile, energy_perf_bias=0, NVMe nr_requests=1023, igc ring buffers, thermal trip at TjMax 100°C)
+- Installs and enables `/etc/systemd/system/nuc16pro-servermax-power.service` (RAPL PL1=104W, PL2=104W, Tau=224s, platform profile, energy_perf_bias=0, NVMe nr_requests=1023, igc ring buffers, thermal trip at TjMax 100°C)
 - Installs `scx-scheds`/`scx-tools` (sched_ext userspace schedulers)
 - Enables `scx_loader` with `scx_bpfland` in Server mode (or direct service as fallback)
 - Updates GRUB cmdline: `threadirqs usbcore.autosuspend=-1 nvme_core.default_ps_max_latency_us=0 zswap.enabled=1 zswap.shrinker_enabled=1 zswap.compressor=zstd zswap.max_pool_percent=20 zswap.zpool=z3fold mitigations=auto intel_pstate=active`
@@ -274,15 +274,15 @@ ip rule add from <wifi-ip> table 200
 
 ### 6. Power Limits and Fan Control
 
-The NUC 16 Pro runs on a 120W AC adapter (19VDC, 6.32A). The `nuc16pro-servermax-power.service` applies at boot:
+The NUC 16 Pro runs on a 120W AC adapter (19VDC, 6.32A) and has dual fans. BIOS Power Limit 1/2 are unlocked to 104W with a 224s time window; the `nuc16pro-servermax-power.service` mirrors this at the OS level at boot:
 
 **RAPL power limits** (via `/sys/class/powercap/intel-rapl/`):
 
-- PL1 = 80W sustained (MTP = max turbo power for the 356H)
-- PL2 = 80W, 60s window (same as PL1; no separate burst cap)
+- PL1 = 104W sustained, Tau = 224s (BIOS-unlocked ceiling, above the 80W MTP default)
+- PL2 = 104W, Tau = 224s (same as PL1; no separate burst cap)
 - Readback logged to journal to confirm BIOS did not lock the MSR
 
-Setting PL1=PL2=MTP removes the sustained/burst distinction so the CPU always runs at the chip's rated maximum.
+Setting PL1=PL2 removes the sustained/burst distinction so the CPU always runs at the BIOS-configured ceiling. At 104W sustained the package is bounded by the dual-fan cooling and hardware PROCHOT (TjMax 100°C), not by software.
 
 **Thermal**: passive trip at 100°C = TjMax for the 356H. No software throttle before hardware PROCHOT.
 
