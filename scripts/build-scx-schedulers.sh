@@ -83,14 +83,14 @@ msg "build manifest"
 RUST_VER="$(rustc --version)"
 CLANG_VER="$(clang --version 2>/dev/null | head -1 || echo unknown)"
 cat > BUILD_MANIFEST << MANIFEST
-SCX_TAG=${SCX_TAG}
-SCX_COMMIT=${SCX_COMMIT}
-RUST_VERSION=${RUST_VER}
-CLANG_VERSION=${CLANG_VER}
-BUILD_DATE_UTC=$(date -u +%Y-%m-%dT%H:%M:%SZ)
-TARGET=x86_64-unknown-linux-gnu
-BASE_IMAGE=ubuntu:26.04
-BINARIES=${SCX_BINARIES[*]}
+SCX_TAG="${SCX_TAG}"
+SCX_COMMIT="${SCX_COMMIT}"
+RUST_VERSION="${RUST_VER}"
+CLANG_VERSION="${CLANG_VER}"
+BUILD_DATE_UTC="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+TARGET="x86_64-unknown-linux-gnu"
+BASE_IMAGE="ubuntu:26.04"
+BINARIES="${SCX_BINARIES[*]}"
 MANIFEST
 
 cat BUILD_MANIFEST
