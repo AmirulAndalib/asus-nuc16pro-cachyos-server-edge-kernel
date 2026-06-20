@@ -1,0 +1,23 @@
+FROM ubuntu:26.04
+
+ENV DEBIAN_FRONTEND=noninteractive
+ENV TZ=Pacific/Auckland
+
+# Same base image as the device (Ubuntu 26.04 LTS, see README Target System)
+# so glibc and shared libs (libelf, libzstd, libseccomp, libbpf, libcap-ng)
+# match exactly. Building on a different Ubuntu release risks a soname
+# mismatch at runtime even when glibc itself is backward-compatible.
+#
+# rustc/cargo are NOT installed here: distro rustc lags crates.io MSRV
+# (apt rustc 1.93 vs scx's own Cargo.lock requiring 1.95+, observed
+# 2026-06-21). The build script installs rustup at run time instead, so
+# the toolchain always tracks current stable rather than this image's
+# build-time apt snapshot.
+RUN apt-get update && \
+    apt-get install -y \
+      git curl ca-certificates build-essential pkg-config \
+      clang llvm libelf-dev zlib1g-dev libzstd-dev libseccomp-dev \
+      libbpf-dev libcap-ng-dev pahole \
+      protobuf-compiler make cmake ninja-build bpftool && \
+    apt-get clean && \
+    rm -rf /var/lib/apt/lists/*

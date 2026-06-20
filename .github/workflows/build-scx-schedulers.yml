@@ -1,0 +1,216 @@
+name: Build scx schedulers (sched-ext/scx)
+
+on:
+  workflow_dispatch:
+    inputs:
+      force:
+        description: 'Force build even if this scx tag already has a release'
+        required: false
+        default: 'false'
+        type: choice
+        options: ['false', 'true']
+  schedule:
+    # 3am UTC daily - clear of the kernel workflows' 9am/9pm UTC slots.
+    - cron: "0 3 * * *"
+
+permissions:
+  contents: write
+
+env:
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+
+concurrency:
+  group: nuc16pro-scx-schedulers
+  cancel-in-progress: false
+
+jobs:
+  build:
+    name: Build scx_bpfland/p2dq/rusty/beerland/lavd for ASUS NUC 16 Pro
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10  # v6.0.3
+
+      - name: Show runner info
+        run: |
+          uname -a
+          df -h
+          free -h
+          docker version
+
+      - name: Pre-flight - skip if scx tag already has a release
+        id: preflight
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+
+          SCX_TAG="$(gh api repos/sched-ext/scx/releases/latest --jq '.tag_name')"
+          if [ -z "$SCX_TAG" ] || [ "$SCX_TAG" = "null" ]; then
+            echo "error: could not resolve sched-ext/scx latest release tag"
+            exit 1
+          fi
+          echo "Upstream scx tag: $SCX_TAG"
+          echo "scx_tag=$SCX_TAG" >> "$GITHUB_OUTPUT"
+
+          RECENT="$(gh release list \
+            --repo "${{ github.repository }}" \
+            --limit 50 \
+            --json tagName \
+            --jq '.[].tagName' 2>/dev/null || true)"
+
+          FORCE_BUILD="${{ github.event.inputs.force }}"
+          if [ "$FORCE_BUILD" = "true" ]; then
+            echo "FORCE: skipping version check, building regardless"
+            echo "skip=false" >> "$GITHUB_OUTPUT"
+          elif echo "$RECENT" | grep -q "scx-${SCX_TAG}-"; then
+            echo "SKIP: $SCX_TAG already has a release."
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+            {
+              echo "### Skipped - already built"
+              echo "scx \`$SCX_TAG\` already present in releases."
+            } >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo "BUILD: $SCX_TAG not yet released"
+            echo "skip=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Set up Docker Buildx
+        if: steps.preflight.outputs.skip != 'true'
+        uses: docker/setup-buildx-action@d7f5e7f509e45cec5c76c4d5afdd7de93d0b3df5  # v4.1.0
+
+      - name: Build builder image
+        if: steps.preflight.outputs.skip != 'true'
+        uses: docker/build-push-action@f9f3042f7e2789586610d6e8b85c8f03e5195baf  # v7.2.0
+        with:
+          context: .
+          file: Dockerfile.scx-builder
+          tags: scx-builder:latest
+          load: true
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Build scx schedulers
+        if: steps.preflight.outputs.skip != 'true'
+        run: |
+          chmod +x scripts/build-scx-schedulers.sh
+          mkdir -p dist
+
+          docker run --rm \
+            -v "$PWD:/work" \
+            -w /work \
+            -e SCX_TAG="${{ steps.preflight.outputs.scx_tag }}" \
+            -e HOST_UID="$(id -u)" \
+            -e HOST_GID="$(id -g)" \
+            scx-builder:latest \
+            bash /work/scripts/build-scx-schedulers.sh
+
+      - name: Verify release assets
+        if: steps.preflight.outputs.skip != 'true'
+        run: |
+          set -euo pipefail
+
+          ls -lh dist/
+          test -f dist/SHA256SUMS
+          test -f dist/BUILD_MANIFEST
+
+          for b in scx_bpfland scx_p2dq scx_rusty scx_beerland scx_lavd; do
+            test -x "dist/$b" || { echo "error: dist/$b missing or not executable"; exit 1; }
+          done
+
+          {
+            echo "## Built scx schedulers"
+            echo '```'
+            ls -lh dist/
+            echo '```'
+            echo "**Build manifest:**"
+            echo '```'
+            cat dist/BUILD_MANIFEST
+            echo '```'
+            echo "**SHA-256 checksums:**"
+            echo '```'
+            cat dist/SHA256SUMS
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload build artifacts
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a  # v7.0.1
+        if: always() && steps.preflight.outputs.skip != 'true'
+        with:
+          name: scx-schedulers-run${{ github.run_number }}-${{ github.run_attempt }}
+          path: dist/
+          retention-days: 7
+
+      - name: Create GitHub Release
+        if: steps.preflight.outputs.skip != 'true'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+
+          source dist/BUILD_MANIFEST
+
+          BUILD_DATE="$(date -u +%Y-%m-%d)"
+          BUILD_DATE_NODASH="$(date -u +%Y%m%d)"
+          CHECKSUMS="$(cat dist/SHA256SUMS)"
+
+          TAG="scx-${SCX_TAG}-${BUILD_DATE_NODASH}.${GITHUB_RUN_NUMBER}"
+          TITLE="scx schedulers ${SCX_TAG} - ASUS NUC 16 Pro - ${BUILD_DATE}"
+
+          cat > /tmp/release-notes.md << NOTES_EOF
+          ## sched-ext/scx ${SCX_TAG}, prebuilt for ASUS NUC 16 Pro
+
+          Userspace sched_ext schedulers built against Ubuntu 26.04 (matching
+          the device's own base image) so dynamically-linked libs (libelf,
+          libzstd, libseccomp, libbpf, libcap-ng) match exactly.
+
+          ### Binaries
+
+          \`${BINARIES}\`
+
+          ### Build Configuration
+
+          - scx tag: \`${SCX_TAG}\`
+          - scx commit: \`${SCX_COMMIT}\`
+          - Rust: \`${RUST_VERSION}\`
+          - Clang: \`${CLANG_VERSION}\`
+          - Target: \`${TARGET}\`
+          - Base image: \`${BASE_IMAGE}\`
+
+          ### SHA-256 Checksums
+
+          \`\`\`
+          ${CHECKSUMS}
+          \`\`\`
+
+          ### Provenance
+
+          - Build timestamp: \`${BUILD_DATE_UTC}\`
+          - Workflow run: ${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}
+
+          ### Not included
+
+          \`scx_loader\`/\`scxctl\` live in the separate sched-ext/scx-loader
+          repo and are not built by this workflow. The device's start script
+          already runs schedulers directly when scx_loader is absent.
+          NOTES_EOF
+
+          gh release create "$TAG" \
+            dist/scx_* dist/SHA256SUMS dist/BUILD_MANIFEST \
+            --title "$TITLE" \
+            --notes-file /tmp/release-notes.md
+
+          RELEASE_URL="${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/releases/tag/${TAG}"
+          {
+            echo "## Release created"
+            echo ""
+            echo "$RELEASE_URL"
+            echo ""
+            echo "| Field | Value |"
+            echo "|-------|-------|"
+            echo "| Tag | \`$TAG\` |"
+            echo "| scx version | \`$SCX_TAG\` |"
+            echo "| scx commit | \`$SCX_COMMIT\` |"
+          } >> "$GITHUB_STEP_SUMMARY"
