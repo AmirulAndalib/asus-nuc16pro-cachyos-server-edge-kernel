@@ -39,7 +39,7 @@ jobs:
 
       - name: Fail if regenerated output differs from committed file
         run: |
-          if ! git diff --exit-status -- scripts/nuc16pro-kernel-updater.sh; then
+          if ! git diff --exit-code -- scripts/nuc16pro-kernel-updater.sh; then
             echo "::error::scripts/nuc16pro-kernel-updater.sh is out of sync with its sources (scripts/nuc16pro-kernel-updater.sh.in, modprobe.d/, sysctl.d/, udev/, systemd/). Edit the sources and re-run scripts/assemble-kernel-updater.sh, then commit the result."
             exit 1
           fi
