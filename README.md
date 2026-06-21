@@ -53,7 +53,7 @@ Tracks `linux-cachyos-server`, CachyOS stable server variant with server-optimiz
 | BTF                    | Enabled (`/sys/kernel/btf/vmlinux` for scx tools)                           |
 | Debug info             | DWARF (toolchain default), required for BTF                                  |
 | CPU power limits       | RAPL PL1=95W, PL2=95W, Tau=224s (silicon caps at 80W MTP)                    |
-| Fan control            | ACPI platform profile: `performance`; ASUS WMI EC interface                  |
+| Fan control            | ACPI `platform_profile=performance`; firmware owns curves                    |
 | USB autosuspend        | Disabled (`usbcore.autosuspend=-1`): full power all ports                    |
 | WiFi power save        | Disabled (`iwlwifi power_save=0`, `iwlmvm power_scheme=1`)                   |
 | energy_perf_bias       | 0 (no microarchitecture power-saving bias on any core)                       |
@@ -288,9 +288,11 @@ PL1 and PL2 are set to 95W on purpose: that is above the 80W silicon MTP, so RAP
 
 **Thermal**: passive trip at 100°C = TjMax for the 356H. No software throttle before hardware PROCHOT.
 
-**ACPI platform profile**: writes `performance` to `/sys/firmware/acpi/platform_profile`. This signals the EC/BIOS to use the performance fan curve.
+**ACPI platform_profile** is the unified control for fan, thermal, and turbo-residency behavior on this board; fan control does not go through hwmon pwm. The OS only selects a profile (`low-power`, `balanced`, `performance`), it does not define a fan curve, so firmware/BIOS keeps ownership of the actual curves. `nuc16pro-servermax-power.service` persists `performance` at boot (max turbo residency, the right default for this throughput target); `balanced` and `low-power` trade sustained performance for a quieter idle.
 
-**ASUS WMI** (`CONFIG_ASUS_WMI=m`): exposes the NUC 16 Pro EC interface for fan boost and platform profile control.
+`asus_armoury` loads but logs `No matching power limits found` (it targets ASUS ROG/TUF laptops, not enterprise NUCs) and drops out, leaving native `platform_profile` in control. `CONFIG_ASUS_WMI=m` provides the `asus-nb-wmi` interface.
+
+**Fan RPM is not exposed** on this board: `asus-nb-wmi` has no fan readout for `NUC16GDBU76`, the raw EC space (`ec_sys`) reads empty, and the Super-IO chip (id `0x1376`) is unsupported by any mainline driver. All temperature sensors work (per-core coretemp, `x86_pkg_temp`, DPTF `TCPU`/`TCPU_PCI`, NVMe, WiFi), which is the actionable thermal signal. Fan speed stays under firmware/BIOS control.
 
 To check current state:
 
@@ -301,10 +303,12 @@ cat /sys/class/powercap/intel-rapl/intel-rapl:0/constraint_1_power_limit_uw
 sensors  # requires lm-sensors
 ```
 
-To list available platform profiles:
+To list or switch platform profiles (live; does not change the persisted boot default):
 
 ```bash
-cat /sys/firmware/acpi/platform_profile_choices
+cat /sys/firmware/acpi/platform_profile_choices                  # low-power balanced performance
+echo balanced | sudo tee /sys/firmware/acpi/platform_profile     # quieter idle, ramps under load
+echo performance | sudo tee /sys/firmware/acpi/platform_profile  # max turbo (boot default)
 ```
 
 ## Manual Build

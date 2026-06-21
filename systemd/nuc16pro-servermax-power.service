@@ -5,7 +5,9 @@ After=multi-user.target
 [Service]
 Type=oneshot
 RemainAfterExit=yes
-# ACPI platform profile: request performance fan curve from EC/BIOS
+# ACPI platform_profile=performance: unified fan/thermal/turbo control on this
+# board (firmware/EC owns the actual fan curve; the OS only picks the profile).
+# performance holds max turbo residency. Runtime-switchable to balanced/low-power.
 ExecStart=/bin/sh -c '[ -f /sys/firmware/acpi/platform_profile ] && echo performance > /sys/firmware/acpi/platform_profile || true'
 # Intel RAPL on 120W AC: PL1=95W, PL2=95W, Tau=224s. The Core Ultra 7 356H has a
 # Maximum Turbo Power of 80W (Intel spec); on-device the package does not exceed
