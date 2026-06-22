@@ -480,7 +480,10 @@ try() {
 # the primary on a backed-off window before demoting to the proven fallback. try()
 # exits the script on attach, so this loop only returns on failure; while it retries
 # the kernel's own EEVDF scheduler runs (the box stays scheduled, just not yet on the
-# custom scheduler).
+# custom scheduler). Tradeoff: if flash never attaches, the bpfland floor lands one
+# full retry window later (~135s) than the old single-attempt chain, so a boot where
+# every retry fails is mildly worse than before (longer EEVDF), not neutral; a boot
+# where a retry catches runs flash for the whole session.
 try_primary() {
   command -v scx_flash >/dev/null 2>&1 || return 1
   i=1
