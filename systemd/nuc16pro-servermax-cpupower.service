@@ -1,10 +1,15 @@
 [Unit]
-Description=NUC 16 Pro ServerMax CPU full performance policy (Panther Lake P/E/LP-E)
+Description=NUC 16 Pro ServerMax CPU performance policy (intel_pstate EPP, Panther Lake P/E/LP-E)
 After=multi-user.target
 
 [Service]
 Type=oneshot
-ExecStart=/bin/sh -c 'for g in /sys/devices/system/cpu/cpu*/cpufreq/scaling_governor; do [ -w "$g" ] && echo performance > "$g" || true; done'
+# intel_pstate runs in active mode. The powersave governor is the right default on
+# this power-limited package (BIOS PL1 ~30W): light cores drop frequency and release
+# budget so loaded cores turbo higher. We do NOT pin the performance governor; it
+# would hold idle cores at max P-state and steal that budget. EPP=performance biases
+# every core toward max under load. power-profiles-daemon is masked by the updater so
+# this oneshot is the single owner of EPP (no boot-time race over the knob).
 ExecStart=/bin/sh -c 'for e in /sys/devices/system/cpu/cpu*/cpufreq/energy_performance_preference; do [ -w "$e" ] && echo performance > "$e" || true; done'
 RemainAfterExit=yes
 

@@ -27,7 +27,10 @@ ExecStart=/bin/sh -c 'iface=$(ls /sys/class/net/ 2>/dev/null | grep -m1 "^e" || 
 # This lets the CPU run at full turbo until hardware PROCHOT fires at TjMax.
 # Only type=passive trips are touched; type=critical (emergency shutdown) is left untouched.
 # Millidegrees: 100000. Writable unconditionally in kernel 6.14+ (no CONFIG_THERMAL_WRITABLE_TRIPS needed).
-ExecStart=/bin/sh -c 'for zone in /sys/class/thermal/thermal_zone*; do ztype=$(cat "$zone/type" 2>/dev/null || true); [ "$ztype" = "x86_pkg_temp" ] || continue; for i in 0 1; do ttype=$(cat "$zone/trip_point_${i}_type" 2>/dev/null || true); ttemp="$zone/trip_point_${i}_temp"; [ "$ttype" = "passive" ] || continue; [ -w "$ttemp" ] && printf 100000 > "$ttemp" 2>/dev/null && echo "thermal: $ttemp=100000" || true; done; done; true'
+# NOTE: the loop index is written $${i} so systemd emits a literal ${i} to the shell.
+# An unescaped ${i} is expanded by systemd itself to an empty string (journal warns
+# "unset environment variable ... i"), which silently breaks the trip-setting loop.
+ExecStart=/bin/sh -c 'for zone in /sys/class/thermal/thermal_zone*; do ztype=$(cat "$zone/type" 2>/dev/null || true); [ "$ztype" = "x86_pkg_temp" ] || continue; for i in 0 1; do ttype=$(cat "$zone/trip_point_$${i}_type" 2>/dev/null || true); ttemp="$zone/trip_point_$${i}_temp"; [ "$ttype" = "passive" ] || continue; [ -w "$ttemp" ] && printf 100000 > "$ttemp" 2>/dev/null && echo "thermal: $ttemp=100000" || true; done; done; true'
 
 [Install]
 WantedBy=multi-user.target

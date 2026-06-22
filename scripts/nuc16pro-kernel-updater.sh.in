@@ -217,7 +217,13 @@ install -Dm644 /dev/stdin /etc/udev/rules.d/60-nuc16pro-ioschedulers.rules <<'UD
 @@FILE:udev/60-nuc16pro-ioschedulers.rules@@
 UDEV
 
-# CPU performance governor + EPP via systemd oneshot
+# power-profiles-daemon owns scaling_governor/EPP on intel_pstate and starts after
+# our oneshot at boot, overriding it (a boot-time race). Mask it so the cpupower
+# service below is the single, deterministic owner of EPP. This drops the GNOME
+# power-profile toggle, which is fine on a performance server (EPP=performance fixed).
+systemctl mask --now power-profiles-daemon.service 2>/dev/null || true
+
+# CPU performance policy (EPP=performance) via systemd oneshot
 # Panther Lake: 4P + 8E + 4LP-E = 16C/16T, no HT
 # All CPU* loops cover P/E/LP-E uniformly; Intel Thread Director + HFI
 # handles per-core-type scheduling automatically at the firmware level.

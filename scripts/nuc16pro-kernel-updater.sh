@@ -257,18 +257,29 @@ ACTION=="add|change", KERNEL=="sd[a-z]|mmcblk[0-9]", ATTR{queue/rotational}=="0"
 ACTION=="add|change", KERNEL=="nvme[0-9]n[0-9]", ATTR{queue/rotational}=="0", ATTR{queue/scheduler}="adios"
 UDEV
 
-# CPU performance governor + EPP via systemd oneshot
+# power-profiles-daemon owns scaling_governor/EPP on intel_pstate and starts after
+# our oneshot at boot, overriding it (a boot-time race). Mask it so the cpupower
+# service below is the single, deterministic owner of EPP. This drops the GNOME
+# power-profile toggle, which is fine on a performance server (EPP=performance fixed).
+systemctl mask --now power-profiles-daemon.service 2>/dev/null || true
+
+# CPU performance policy (EPP=performance) via systemd oneshot
 # Panther Lake: 4P + 8E + 4LP-E = 16C/16T, no HT
 # All CPU* loops cover P/E/LP-E uniformly; Intel Thread Director + HFI
 # handles per-core-type scheduling automatically at the firmware level.
 install -Dm644 /dev/stdin /etc/systemd/system/nuc16pro-servermax-cpupower.service <<'SERVICE'
 [Unit]
-Description=NUC 16 Pro ServerMax CPU full performance policy (Panther Lake P/E/LP-E)
+Description=NUC 16 Pro ServerMax CPU performance policy (intel_pstate EPP, Panther Lake P/E/LP-E)
 After=multi-user.target
 
 [Service]
 Type=oneshot
-ExecStart=/bin/sh -c 'for g in /sys/devices/system/cpu/cpu*/cpufreq/scaling_governor; do [ -w "$g" ] && echo performance > "$g" || true; done'
+# intel_pstate runs in active mode. The powersave governor is the right default on
+# this power-limited package (BIOS PL1 ~30W): light cores drop frequency and release
+# budget so loaded cores turbo higher. We do NOT pin the performance governor; it
+# would hold idle cores at max P-state and steal that budget. EPP=performance biases
+# every core toward max under load. power-profiles-daemon is masked by the updater so
+# this oneshot is the single owner of EPP (no boot-time race over the knob).
 ExecStart=/bin/sh -c 'for e in /sys/devices/system/cpu/cpu*/cpufreq/energy_performance_preference; do [ -w "$e" ] && echo performance > "$e" || true; done'
 RemainAfterExit=yes
 
@@ -313,7 +324,10 @@ ExecStart=/bin/sh -c 'iface=$(ls /sys/class/net/ 2>/dev/null | grep -m1 "^e" || 
 # This lets the CPU run at full turbo until hardware PROCHOT fires at TjMax.
 # Only type=passive trips are touched; type=critical (emergency shutdown) is left untouched.
 # Millidegrees: 100000. Writable unconditionally in kernel 6.14+ (no CONFIG_THERMAL_WRITABLE_TRIPS needed).
-ExecStart=/bin/sh -c 'for zone in /sys/class/thermal/thermal_zone*; do ztype=$(cat "$zone/type" 2>/dev/null || true); [ "$ztype" = "x86_pkg_temp" ] || continue; for i in 0 1; do ttype=$(cat "$zone/trip_point_${i}_type" 2>/dev/null || true); ttemp="$zone/trip_point_${i}_temp"; [ "$ttype" = "passive" ] || continue; [ -w "$ttemp" ] && printf 100000 > "$ttemp" 2>/dev/null && echo "thermal: $ttemp=100000" || true; done; done; true'
+# NOTE: the loop index is written $${i} so systemd emits a literal ${i} to the shell.
+# An unescaped ${i} is expanded by systemd itself to an empty string (journal warns
+# "unset environment variable ... i"), which silently breaks the trip-setting loop.
+ExecStart=/bin/sh -c 'for zone in /sys/class/thermal/thermal_zone*; do ztype=$(cat "$zone/type" 2>/dev/null || true); [ "$ztype" = "x86_pkg_temp" ] || continue; for i in 0 1; do ttype=$(cat "$zone/trip_point_$${i}_type" 2>/dev/null || true); ttemp="$zone/trip_point_$${i}_temp"; [ "$ttype" = "passive" ] || continue; [ -w "$ttemp" ] && printf 100000 > "$ttemp" 2>/dev/null && echo "thermal: $ttemp=100000" || true; done; done; true'
 
 [Install]
 WantedBy=multi-user.target
