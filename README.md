@@ -288,7 +288,9 @@ Verify aggregation:
 cat /proc/net/bonding/bond0   # want: 802.3ad, non-zero Partner Mac (the switch), both slaves MII up, same Aggregator ID
 ```
 
-This is a deliberate one-time manual step, **not** part of the daily updater - auto-applying a bond unattended could leave the box unreachable on reboot if the switch side ever changes. Once applied the config lives in `/etc/netplan` and persists across reboots on its own.
+**Troubleshooting LACP** (`Partner Mac Address: 00:00:00:00:00:00`): a zero partner MAC plus each slave on a *different* `Aggregator ID` means the switch is not answering LACP - the two ports are not in an LACP group on the switch. Confirm with `tcpdump -i <slave> -nne ether proto 0x8809`: if every LACPDU source is one of the NUC's own NIC MACs (never the switch's), the switch is flooding the frames rather than bundling them. Fix on the switch: the LAG must have **both** NIC ports as members **and** type **LACP / dynamic** (a LAG left on **Static** sends no LACPDUs, so Linux mode `802.3ad` never bundles). If the switch only offers a **static** trunk, change the bond `mode` to `balance-xor` and `transmit-hash-policy` to `layer2+3` to match it; if no switch LAG is possible at all, `balance-alb` aggregates with no switch config (less ideal on a container host with bridges). The `netplan apply` "systemd-networkd ... Falling back to a hard restart" line is benign on this NetworkManager-rendered box - networkd only renders `.link` naming files and manages no interfaces.
+
+This is a deliberate one-time manual step, **not** part of the daily updater - auto-applying a bond unattended could leave the box unreachable on reboot if the switch side ever changes. Once applied the config lives in `/etc/netplan` and persists across reboots on its own (NM connections `autoconnect=yes`, MAC cloned so the IP holds).
 
 `net.ipv4.conf.all.rp_filter = 2` (loose) stays set so the WiFi failover path and the wired path can both receive traffic without the kernel dropping asymmetrically-routed packets.
 
