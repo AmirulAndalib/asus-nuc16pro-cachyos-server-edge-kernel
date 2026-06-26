@@ -29,7 +29,7 @@ Tracks `linux-cachyos-server`, CachyOS stable server variant with server-optimiz
 | Setting                | Value                                                                        |
 | ---------------------- | ---------------------------------------------------------------------------- |
 | Base scheduler         | EEVDF (servermax profile)                                                    |
-| sched_ext              | Compiled in, `scx_flash` auto-starts on install (verifies attach, falls back to `scx_bpfland`) |
+| sched_ext              | Compiled in, `scx_flash` auto-starts before the docker fleet (unit ordered `After=basic.target Before=docker.service`, bounded retry on boot-storm ENOMEM; verifies attach, falls back to `scx_bpfland`) |
 | Compiler               | LLVM / Clang + LLD                                                           |
 | LTO                    | ThinLTO                                                                      |
 | CPU target             | x86-64-v3 (AVX2, BMI2, FMA, LZCNT)                                          |
@@ -37,13 +37,13 @@ Tracks `linux-cachyos-server`, CachyOS stable server variant with server-optimiz
 | Preemption             | Lazy (throughput lean; RT-class IRQs preempt immediately)                                                        |
 | Transparent Huge Pages | always                                                                       |
 | TCP congestion         | BBR (mainline)                                                               |
-| I/O scheduler          | ADIOS (SSDs/NVMe), BFQ (HDDs) via udev                                       |
-| Zswap                  | Enabled (zstd, z3fold, 20% pool)                                             |
+| I/O scheduler          | ADIOS (SSDs/NVMe), BFQ (HDDs) via udev + `modules-load.d` (adios is `=m`)                                       |
+| Zswap                  | Enabled (zstd compressor, zsmalloc pool, 20%)                                             |
 | Async I/O              | io_uring enabled                                                             |
 | Network offload        | TLS kernel offload, XDP sockets                                              |
 | Block layer            | BLK_WBT writeback throttling, NVMe multipath                                 |
 | NVMe power states      | Disabled (`nvme_core.default_ps_max_latency_us=0`, Gen4/Gen5 max perf)       |
-| Dual NIC               | `rp_filter=2` (loose): WiFi 7 + 2.5GbE simultaneous use                     |
+| Network                | 2x 2.5GbE bonded (balance-xor, static LAG; §5); WiFi 7 failover; `rp_filter=2` loose                     |
 | GPU driver             | `xe` (Intel Xe3 LP Panther Lake, GuC auto-enabled); `i915` kept as fallback  |
 | IRQ affinity           | `threadirqs`: spread IRQs across P/E/LP-E cores                              |
 | Cgroup v2              | Full stack (CFS_BANDWIDTH, all controllers)                                  |
@@ -58,7 +58,7 @@ Tracks `linux-cachyos-server`, CachyOS stable server variant with server-optimiz
 | WiFi power save        | Disabled (`iwlwifi power_save=0`, `iwlmvm power_scheme=1`)                   |
 | energy_perf_bias       | 0 (no microarchitecture power-saving bias on any core)                       |
 | NVMe queue depth       | `nr_requests=1023` per namespace at boot                                     |
-| igc ring buffers       | rx=4096 tx=4096 (I226-V 2.5GbE max throughput)                              |
+| igc ring buffers       | rx=4096 tx=4096 on both I226-V 2.5GbE ports                              |
 | Thermal trip           | Passive trip at TjMax (100°C) - no software throttle before hardware PROCHOT |
 
 ## SCX Scheduler Notes (Panther Lake)
@@ -69,6 +69,8 @@ Panther Lake has 4P + 8E + 4LP-E = 16C/16T with Intel Thread Director + HFI, het
 - **Fallback chain**: `scx_bpfland -s 20000 -S` -> `scx_p2dq` -> `scx_bpfland` (no args) -> `scx_rusty` -> `scx_beerland` -> `scx_lavd`
 
 The start script **verifies each scheduler actually attaches** to sched_ext (`/sys/kernel/sched_ext/root/ops`) before committing to it. A primary that dies or never attaches degrades to the next candidate, never to "no scheduler". So if `scx_flash` is absent or fails to attach, the box lands on the proven `scx_bpfland`.
+
+**Boot ordering:** the unit is `After=basic.target` + `Before=docker.service`, so `scx_flash` attaches while the system is quiet, before the ~20 `docker-<app>.service` units launch. sched_ext runs `ops.cgroup_init()` once per existing cgroup at attach time, so attaching mid-storm tried to initialize ~175 cgroups in one batch under boot slab pressure and transiently failed `-ENOMEM` (demoting to the fallback). Attaching first means a handful of cgroups, then each container's cgroup is initialized incrementally as it starts. A bounded retry (`try_primary`) covers the residual early-boot slab-pressure case.
 
 `scx_lavd` is topology-aware for P/E/LP-E but has a documented E-core over-prioritization issue (observed on the sibling Lunar Lake architecture). It remains as a late fallback until upstream resolves it.
 
@@ -229,12 +231,13 @@ On first run and each new release, the installer handles everything without manu
 - Writes `/etc/modprobe.d/xe-nuc16pro.conf` (comment-only; `xe` driver needs no options for Panther Lake iGPU)
 - Writes `/etc/modprobe.d/nuc16pro-wifi.conf` (`iwlwifi power_save=0`, `iwlmvm power_scheme=1`)
 - Writes `/etc/sysctl.d/99-nuc16pro-servermax.conf` (BBR+FQ, large buffers, inotify, vm tuning, `rp_filter=2` for dual NIC)
-- Writes `/etc/udev/rules.d/60-nuc16pro-ioschedulers.rules` (ADIOS for SSDs/NVMe, BFQ for HDDs)
+- Writes `/etc/udev/rules.d/60-nuc16pro-ioschedulers.rules` (ADIOS for SSDs/NVMe, BFQ for HDDs) plus `/etc/modules-load.d/nuc16pro-adios.conf` - adios is built `=m` and lacks the `<name>-iosched` autoload alias bfq has, so without force-loading it the udev rule silently no-ops and SSD/NVMe fall back to mq-deadline/none
 - Installs and enables `/etc/systemd/system/nuc16pro-servermax-cpupower.service` (EPP=performance, HWP dynamic boost, and platform_profile=performance on all P/E/LP-E cores; masks `power-profiles-daemon` so it stays the single owner)
-- Installs and enables `/etc/systemd/system/nuc16pro-servermax-power.service` (BIOS owns PL1/PL2/Tau and the platform profile; the OS sets only energy_perf_bias=0, NVMe nr_requests=1023, igc ring buffers, and the TjMax 100°C thermal trip, all within the BIOS power envelope)
+- Installs and enables `/etc/systemd/system/nuc16pro-servermax-power.service` (BIOS owns PL1/PL2/Tau and the platform profile; the OS sets only energy_perf_bias=0, NVMe nr_requests=1023, igc ring buffers on every I226-V port, and the TjMax 100°C thermal trip, all within the BIOS power envelope)
+- Writes `/etc/systemd/system/plymouth-quit-wait.service.d/10-headless-noop.conf` - this headless box has no graphical handoff, so the stock `plymouth --wait` blocks `multi-user.target` forever (infinite timeout) and starves every `After=multi-user.target` unit including the tuning oneshots; the drop-in replaces it with a no-op so the target completes and tuning applies on boot
 - Downloads `scx_flash`, `scx_bpfland`, `scx_p2dq`, `scx_rusty`, `scx_beerland`, `scx_lavd` from this repo's own `scx-*` GitHub release (built by `build-scx-schedulers.yml`), verifies against `SHA256SUMS`, installs to `/usr/local/bin`
 - Enables `scx_loader` with `scx_flash` in Server mode (or direct service as fallback)
-- Updates GRUB cmdline: `threadirqs usbcore.autosuspend=-1 nvme_core.default_ps_max_latency_us=0 zswap.enabled=1 zswap.shrinker_enabled=1 zswap.compressor=zstd zswap.max_pool_percent=20 zswap.zpool=z3fold mitigations=auto intel_pstate=active preempt=lazy`
+- Updates GRUB cmdline: `threadirqs usbcore.autosuspend=-1 nvme_core.default_ps_max_latency_us=0 zswap.enabled=1 zswap.shrinker_enabled=1 zswap.compressor=zstd zswap.max_pool_percent=20 mitigations=auto intel_pstate=active preempt=lazy` (`zswap.zpool=z3fold` dropped: z3fold was removed upstream, zswap falls back to the zsmalloc default)
 - Removes stale `i915.enable_guc=3` if present from previous config
 - Purges all previous custom `cachyos-nuc16pro` kernels, keeping only the newest installed + the currently running kernel (panic fallback)
 - Adds `lz4` and `asus_wmi` to initramfs modules
@@ -263,19 +266,39 @@ sudo scx_lavd                        # lavd (P/E/LP-E topology-aware, use with c
 scxctl start --scheduler scx_flash --mode Server
 ```
 
-### 5. Dual NIC: WiFi 7 + 2.5GbE simultaneously
+### 5. Network: dual 2.5GbE bond + WiFi failover
 
-The sysctl `net.ipv4.conf.all.rp_filter = 2` (loose reverse-path filter) allows both NICs to receive traffic simultaneously, enabling:
+The box has two Intel I226-V 2.5GbE ports plus WiFi 7. The two wired ports are bonded for aggregate LAN throughput and link redundancy; WiFi stays a separate failover path.
 
-- Default route via 2.5GbE (`igc`)
-- Policy routing or bonding via WiFi 7 (`iwlwifi`)
+**This box uses `balance-xor` (static LAG).** The upstream switch is a Grandstream GWN7721 (Lite-managed), which supports **static** link aggregation only - no LACP / 802.3ad. So the bond runs `mode: balance-xor` to match a static trunk: both ports active, TX spread across them by the hash policy. The bond mode must match the switch LAG type (static <-> `balance-xor`, LACP <-> `802.3ad`) or the link flaps. If your switch *does* support 802.3ad, use `mode: 802.3ad` + `lacp-rate: fast` instead (cleaner, switch-negotiated, detects miswiring).
 
-To route specific traffic via WiFi:
+**Reality check:** a single TCP stream still caps at one link's 2.5 Gbps - the bond aggregates *across multiple concurrent flows*, it does not speed up one transfer. Internet traffic is capped by the WAN uplink, so the bond mainly helps LAN-internal many-flow workloads. WiFi cannot be bonded with Ethernet for throughput; its role is failover.
+
+**Hash policy - keep `layer3+4`.** The transmit hash is a *local* decision on the NUC (which slave each outgoing flow uses); the switch does not parse or need to "understand" it. `layer3+4` (src/dst IP + L4 port) spreads flows best - including internet-bound traffic, which all shares the router's MAC and would pile onto **one** link under `layer2`. So `layer2` is the *wrong* move here despite common advice; `layer3+4` is correct for an internet-facing server. (RX distribution, switch -> NUC, is the switch's own hash, not tunable on a basic switch; the NUC accepts frames on both ports regardless.)
+
+**Prerequisite (switch side):** create a **static LAG / trunk** on the two ports the NICs connect to (Grandstream GWN7721: *Link Aggregation* -> add both ports). The Linux bond mode must match: static trunk -> `balance-xor`; LACP/dynamic -> `802.3ad`.
+
+`netplan/99-nuc16pro-bond.yaml` is the canonical config (`balance-xor`, `layer3+4`, bond MAC cloned from the primary NIC so the DHCP lease / IP and router port-forwards are preserved). `scripts/nuc16pro-bond-apply.sh` applies it **safely**: it arms a PID1-owned auto-revert that survives the SSH drop during cutover and keeps the bond only if the box can still reach its gateway, so a wrong switch LAG just rolls back.
+
+Run it from the **physical console** (the cutover briefly drops SSH as the IP moves to `bond0`):
 
 ```bash
-ip route add <destination> dev <wifi-iface> table 200
-ip rule add from <wifi-ip> table 200
+sudo bash scripts/nuc16pro-bond-apply.sh
 ```
+
+Verify it is aggregating:
+
+```bash
+cat /proc/net/bonding/bond0                       # Bonding Mode: load balancing (xor); both slaves MII up, Link Failure Count 0
+cat /sys/class/net/enp86s0/statistics/tx_packets  # both counters climb under multi-flow load
+cat /sys/class/net/enp87s0/statistics/tx_packets
+```
+
+For an `802.3ad` LAG instead, "working" is `Partner Mac` = the switch's real MAC, both slaves on the same `Aggregator ID`, `Number of ports: 2`. A `Partner Mac` of all-zeros means the switch is not running LACP on those ports (confirm with `tcpdump -i <slave> -nne ether proto 0x8809`: only the NUC's own NIC MACs appear) - use `balance-xor` + a static LAG, as here.
+
+This is a deliberate one-time manual step, **not** part of the daily updater - auto-applying a bond unattended could leave the box unreachable on reboot if the switch side changes. Once applied the config lives in `/etc/netplan` and persists across reboots (NM connections `autoconnect=yes`, MAC cloned so the IP holds). The `netplan apply` "systemd-networkd ... Falling back to a hard restart" line is benign on this NetworkManager-rendered box.
+
+`net.ipv4.conf.all.rp_filter = 2` (loose) stays set so the WiFi failover path and the wired path can both receive traffic without the kernel dropping asymmetrically-routed packets.
 
 ### 6. Power Limits and Fan Control
 

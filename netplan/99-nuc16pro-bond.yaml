@@ -1,0 +1,25 @@
+# Reference bond config for the NUC 16 Pro's two Intel I226-V (igc) 2.5GbE ports.
+#
+# This committed copy is GENERIC and carries no host-specific data. The real config is
+# generated on the box by scripts/nuc16pro-bond-apply.sh, which auto-detects the two igc
+# NICs, clones the *primary* NIC's MAC onto the bond (so the existing DHCP lease / IP and any
+# router port-forwards are preserved), and detects the gateway - none of which is hardcoded
+# here. The interface names below are the usual NUC 16 Pro PCI names; the script discovers the
+# actual NICs by driver.
+#
+# Mode: balance-xor matches a STATIC switch LAG (e.g. Grandstream GWN7721, which has no LACP).
+# If your switch supports 802.3ad LACP, run the apply script with arg "802.3ad" instead.
+# Reality: a single stream still caps at one link's 2.5 Gbps; the bond aggregates across
+# multiple concurrent flows.
+network:
+  version: 2
+  renderer: NetworkManager
+  bonds:
+    bond0:
+      interfaces: [enp86s0, enp87s0]
+      dhcp4: true
+      dhcp6: true
+      parameters:
+        mode: balance-xor
+        mii-monitor-interval: 100
+        transmit-hash-policy: layer3+4
