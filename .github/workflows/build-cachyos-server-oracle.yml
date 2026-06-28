@@ -168,7 +168,7 @@ jobs:
       - name: Restore ccache
         id: restore-ccache
         if: steps.preflight.outputs.skip != 'true'
-        uses: actions/cache/restore@27d5ce7f107fe9357f9df03efb73ab90386fccae  # v5.0.5
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9  # v6.1.0
         with:
           path: ~/.cache/ccache-cachyos
           key: ccache-${{ runner.os }}-aarch64-cross-x86_64v3-${{ steps.preflight.outputs.kver }}
