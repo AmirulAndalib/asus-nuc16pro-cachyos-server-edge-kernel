@@ -1,0 +1,11 @@
+[Unit]
+Description=Run the NUC 16 Pro ServerMax health report post-boot and daily
+
+[Timer]
+OnBootSec=5min
+OnCalendar=daily
+Persistent=true
+RandomizedDelaySec=45
+
+[Install]
+WantedBy=timers.target

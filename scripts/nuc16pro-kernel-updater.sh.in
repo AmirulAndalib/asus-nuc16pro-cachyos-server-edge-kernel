@@ -84,6 +84,20 @@ msg "ensuring tools"
 apt-get update -qq
 apt-get install -y curl jq ca-certificates ethtool lm-sensors
 
+msg "ensuring media (VA-API) + diagnostic userspace"
+# The kernel alone does not provide VA-API: hardware transcode needs the Intel iHD userspace
+# media driver, validated 2026-07 (vainfo failed with "va_openDriver() returns -1" until these
+# were installed). Kept in a SEPARATE, non-fatal apt call so an unavailable package on a given
+# release degrades gracefully instead of aborting the kernel install. Deliberately NOT installing
+# intel-gsc: it is absent from the Ubuntu 26.04 repos and, bundled into one transaction, aborts
+# the whole install (apt validates the full package list up front, so one missing name kills it).
+# GSC firmware loads kernel-side from xe/ptl_gsc_1.bin regardless of this userspace package.
+# smartmontools + nvme-cli back the post-boot health-check's drive-SMART section.
+apt-get install -y \
+  intel-media-va-driver-non-free libigdgmm12 libmfx-gen1.2 libvpl-tools vainfo \
+  smartmontools nvme-cli \
+  || echo "warn: some media/diagnostic packages unavailable on this release, continuing"
+
 msg "fetching latest release"
 # Use list endpoint, not /releases/latest, so RC prereleases are included.
 # Exclude the scx-* stream: this repo publishes both kernel and scx-scheduler
@@ -473,6 +487,27 @@ if [ "$NEED_REBOOT_ONLY" -eq 2 ]; then
     echo "SCX active, no update"
   fi
 fi
+
+msg "installing post-boot health-check"
+# Read-only status report (kernel, failed units, scx attach + cgroup_init count, xe/firmware,
+# VA-API, bond, memory, thermal, NVMe SMART, docker health) run ~5 min post-boot and daily by a
+# timer; output lands in the journal (journalctl -u nuc16pro-healthcheck). Recommended by the
+# Panther Lake validation report. Never changes state.
+install -Dm755 /dev/stdin /usr/local/sbin/nuc16pro-healthcheck <<'HEALTHCHECK'
+@@FILE:scripts/nuc16pro-healthcheck.sh@@
+HEALTHCHECK
+
+install -Dm644 /dev/stdin /etc/systemd/system/nuc16pro-healthcheck.service <<'HC_SVC'
+@@FILE:systemd/nuc16pro-healthcheck.service@@
+HC_SVC
+
+install -Dm644 /dev/stdin /etc/systemd/system/nuc16pro-healthcheck.timer <<'HC_TIMER'
+@@FILE:systemd/nuc16pro-healthcheck.timer@@
+HC_TIMER
+
+systemctl daemon-reload
+systemctl enable nuc16pro-healthcheck.timer || true
+systemctl start nuc16pro-healthcheck.timer || true
 
 msg "applying sysctl and udev"
 sysctl --system       || true

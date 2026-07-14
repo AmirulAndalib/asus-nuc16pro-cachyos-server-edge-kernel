@@ -228,6 +228,7 @@ On first run and each new release, the installer handles everything without manu
 - Downloads and verifies `.deb` packages (SHA-256)
 - Installs kernel packages via `dpkg`
 - Installs `linux-image-generic` as fallback
+- Installs the Intel VA-API media userspace (`intel-media-va-driver-non-free`, `libigdgmm12`, `libmfx-gen1.2`, `libvpl-tools`, `vainfo`) plus `smartmontools` + `nvme-cli` in a separate non-fatal apt step; deliberately excludes `intel-gsc` (absent from the Ubuntu 26.04 repos, and bundling it would abort the whole transaction)
 - Writes `/etc/modprobe.d/xe-nuc16pro.conf` (comment-only; `xe` driver needs no options for Panther Lake iGPU)
 - Writes `/etc/modprobe.d/nuc16pro-wifi.conf` (`iwlwifi power_save=0`, `iwlmvm power_scheme=1`)
 - Writes `/etc/sysctl.d/99-nuc16pro-servermax.conf` (BBR+FQ, large buffers, inotify, vm tuning, `rp_filter=2` for dual NIC)
@@ -237,6 +238,7 @@ On first run and each new release, the installer handles everything without manu
 - Writes `/etc/systemd/system/plymouth-quit-wait.service.d/10-headless-noop.conf` - this headless box has no graphical handoff, so the stock `plymouth --wait` blocks `multi-user.target` forever (infinite timeout) and starves every `After=multi-user.target` unit including the tuning oneshots; the drop-in replaces it with a no-op so the target completes and tuning applies on boot
 - Downloads `scx_flash`, `scx_bpfland`, `scx_p2dq`, `scx_rusty`, `scx_beerland`, `scx_lavd` from this repo's own `scx-*` GitHub release (built by `build-scx-schedulers.yml`), verifies against `SHA256SUMS`, installs to `/usr/local/bin`
 - Enables `scx_loader` with `scx_flash` in Server mode (or direct service as fallback)
+- Installs and enables `nuc16pro-healthcheck.timer`: a read-only post-boot (~5 min) and daily health report (kernel, failed units, sched_ext attach state + cgroup_init count, xe/firmware, VA-API, bond, memory, thermal, NVMe SMART, docker health) logged to the journal (`journalctl -u nuc16pro-healthcheck`)
 - Updates GRUB cmdline: `threadirqs usbcore.autosuspend=-1 nvme_core.default_ps_max_latency_us=0 zswap.enabled=1 zswap.shrinker_enabled=1 zswap.compressor=zstd zswap.max_pool_percent=20 mitigations=auto intel_pstate=active preempt=lazy` (`zswap.zpool=z3fold` dropped: z3fold was removed upstream, zswap falls back to the zsmalloc default)
 - Removes stale `i915.enable_guc=3` if present from previous config
 - Purges all previous custom `cachyos-nuc16pro` kernels, keeping only the newest installed + the currently running kernel (panic fallback)
@@ -331,6 +333,39 @@ cat /sys/firmware/acpi/platform_profile_choices                  # low-power bal
 echo performance | sudo tee /sys/firmware/acpi/platform_profile  # bias toward max turbo
 echo balanced | sudo tee /sys/firmware/acpi/platform_profile     # lower sustained power, quieter
 ```
+
+### 7. GPU media stack, PXP/GSC firmware, and monitoring
+
+The `xe` driver binds Panther Lake (`8086:b0a0`) natively with no `force_probe`, and the DMC, GuC, HuC, and GSC firmware all load.
+
+**VA-API hardware transcode needs a userspace driver the kernel does not ship.** On a fresh box `vainfo` fails with `va_openDriver() returns -1` until the Intel iHD media stack is present. The updater now installs it automatically in a separate, non-fatal apt step: `intel-media-va-driver-non-free`, `libigdgmm12`, `libmfx-gen1.2`, `libvpl-tools`, `vainfo`. Two gotchas, both learned on this box:
+
+- **Do not add `intel-gsc` to that apt line.** It is not in the Ubuntu 26.04 repos; apt validates the whole package list up front, so one unavailable name aborts the entire transaction and leaves VA-API broken. The kernel-side GSC firmware (`xe/ptl_gsc_1.bin`) loads regardless and is unrelated to this userspace package.
+- Plex bundles its own iHD driver and VA libraries inside its container, so Plex transcodes even without the host stack. The host packages matter for other host-side or containerized transcoders that use `/dev/dri` plus the host `iHD_drv_video.so`.
+
+**PXP (protected content) is unavailable, and that is expected.** The kernel refuses PXP because the PTL GSC firmware currently shipped by `linux-firmware` is older than the build the kernel requires. `journalctl -k | grep -i pxp` shows the message and the exact required build:
+
+```
+xe 0000:00:02.0: [drm] PXP requires PTL GSC build <N> or newer
+```
+
+Ordinary VA-API decode/encode/transcode is unaffected. This is a firmware-version limitation, not a kernel bug: do not hand-replace the GSC firmware; wait for a `linux-firmware` update to ship a new enough PTL GSC build.
+
+**Monitoring: use `nvtop`.** `intel_gpu_top` enumerates Panther Lake (`intel_gpu_top -L`) but cannot read live engine telemetry under the `xe` driver yet (`Failed to detect engines... i915 PMU`); it expects the old i915 PMU interface. `nvtop` reads the `xe` telemetry correctly (per-engine load, clocks, VRAM, per-process). No kernel change is warranted for `intel_gpu_top`.
+
+### 8. sched_ext boot ENOMEM (expected, self-healing)
+
+On this box `scx_flash`'s `ops.cgroup_init()` transiently fails `-ENOMEM` during the boot container storm (verified: several events per boot). This is not a fault. The start script's bounded `try_primary` retry re-attaches `scx_flash` once the storm eases, so the scheduler ends up attached and stable with the scx unit's `NRestarts=0` (systemd never even has to restart it). Verified steady state: `sched_ext: enabled`, `root/ops = flash_...`. No action needed; the fallback chain (`scx_bpfland` and the rest) and the systemd `Restart=on-failure` remain as deeper safety nets. The health-check reports the per-boot count so a genuine regression (scheduler ending up detached) is visible.
+
+### 9. Known-benign firmware messages (BIOS/EC, not the kernel)
+
+These appear in the log on this board and are harmless to operation. They are ASUS BIOS/EC firmware issues, not custom-kernel issues; report them to ASUS if you want them fixed upstream:
+
+- `ACPI BIOS Error ... Could not resolve symbol [\_SB.PC00.LPCB.HEC.RCFS/RFCS]` and the DPTF/`_FST` fan-state methods that abort from it (repeats roughly every few minutes). CPU temperature monitoring and BIOS/EC fan control keep working.
+- `ucsi_acpi USBC000:00: error -ETIMEDOUT: PPM init failed` (USB-C UCSI). No observed impact on operation; USB-C/TB4 function was not part of this validation.
+- `ACPI: thermal: [Firmware Bug]: Invalid critical threshold (-274000)` and `intel-hid ...: failed to enable HID power button`.
+
+The updater does not suppress these; their cause is understood (firmware) and silencing them would hide real future messages.
 
 ## Manual Build
 
