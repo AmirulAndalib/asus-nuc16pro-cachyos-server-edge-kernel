@@ -699,10 +699,16 @@ else
 fi
 
 sec network
-if [ -f /proc/net/bonding/bond0 ]; then
-  mode=$(awk -F': ' '/Bonding Mode/{print $2; exit}' /proc/net/bonding/bond0)
-  up=$(grep -c 'MII Status: up' /proc/net/bonding/bond0)
-  note "bond0: ${mode:-?}; interfaces MII up: $up"
+if [ -d /sys/class/net/bond0 ]; then
+  mode=$(cat /sys/class/net/bond0/bonding/mode 2>/dev/null)
+  slaves=$(cat /sys/class/net/bond0/bonding/slaves 2>/dev/null)
+  up=0; tot=0
+  for s in $slaves; do
+    tot=$((tot + 1))
+    [ "$(cat /sys/class/net/"$s"/operstate 2>/dev/null)" = up ] && up=$((up + 1))
+  done
+  note "bond0: mode ${mode%% *}; slaves up: $up/$tot (${slaves:-none})"
+  { [ "$tot" -gt 0 ] && [ "$up" -eq "$tot" ]; } || flag "bond0 has slaves down ($up/$tot up)"
 else
   note "bond0: not configured"
 fi
@@ -738,8 +744,10 @@ fi
 if command -v smartctl >/dev/null 2>&1; then
   for d in /dev/sd[a-z]; do
     [ -e "$d" ] || continue
-    h=$(smartctl -H "$d" 2>/dev/null | grep -iE 'overall-health|test result' | sed 's/.*: *//')
+    h=$(smartctl -H "$d" 2>/dev/null | grep -iE 'overall-health|SMART Health Status|test result' | head -1 | sed 's/.*: *//')
+    [ -z "$h" ] && h=$(smartctl -H -d sat "$d" 2>/dev/null | grep -iE 'overall-health|test result' | head -1 | sed 's/.*: *//')
     note "$(basename "$d"): SMART ${h:-n/a}"
+    case "$h" in *FAIL*) flag "$(basename "$d") SMART: $h" ;; esac
   done
 fi
 
