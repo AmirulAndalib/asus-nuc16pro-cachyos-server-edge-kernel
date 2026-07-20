@@ -366,14 +366,16 @@ jobs:
           - CPU policy: \`${CPU_POLICY}\`
           - RCU lazy: \`${RCU_LAZY}\`
 
-          ### Runtime Defaults
+          ### Runtime Defaults (servermax host tuning, applied by the updater)
 
-          - CPU governor: \`performance\`
-          - Intel EPP: \`performance\`
-          - GPU driver: \`xe\` (Intel Xe3 LP Panther Lake, GuC auto-enabled)
-          - SCX server scheduler: \`scx_bpfland -s 20000 -S\`
-          - zswap: \`zstd\`, \`z3fold\`, \`20%\`
-          - TCP: \`bbr\` + \`fq\`
+          - CPU freq: \`intel_pstate\` active + HWP, \`powersave\` governor with \`EPP=performance\` and \`hwp_dynamic_boost=1\`. Hardware scales each core idle->full turbo on demand; a pinned \`performance\` governor is deliberately avoided so idle cores release power budget to loaded cores under the 80 W MTP cap.
+          - ACPI platform_profile: \`performance\` (firmware DPTF power slider to max)
+          - sched_ext: \`scx_flash\` primary (EDF, latency-weighted); fallback \`scx_bpfland\` -> \`scx_p2dq\` -> \`scx_rusty\` -> \`scx_beerland\` -> \`scx_lavd\`. Kernel also bakes scx_bpfland as the compiled-in auto-enable.
+          - GPU: \`xe\` (Intel Xe3-LP Panther Lake, GuC/HuC auto-enabled); VA-API AV1 / HEVC / H.264 / VP9 encode + decode
+          - zswap: \`zstd\` / \`zsmalloc\` / \`20%\` (z3fold removed upstream)
+          - I/O scheduler: \`adios\`; THP \`always\`; io_uring / XDP sockets / TLS offload enabled
+          - NVMe power states off (\`nvme_core.default_ps_max_latency_us=0\`); TCP \`bbr\` + \`fq\`
+          - CPU vulnerability mitigations: \`auto\` (kept on - internet-exposed)
 
           ### SHA-256 Checksums
 
