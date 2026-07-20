@@ -323,7 +323,7 @@ install_scx_from_release() {
   rm -rf "$scx_work"
   mkdir -p "$scx_work"
 
-  jq -r '.assets[] | select(.name | test("^(scx_flash|scx_bpfland|scx_p2dq|scx_rusty|scx_beerland|scx_lavd|SHA256SUMS|BUILD_MANIFEST)$")) | .browser_download_url' \
+  jq -r '.assets[] | select(.name | test("^(scx_flash|scx_bpfland|scx_p2dq|scx_rusty|scx_beerland|scx_lavd|scx_loader|scxctl|scx_loader[.]service|org[.]scx[.]Loader[.]service|org[.]scx[.]Loader[.]conf|org[.]scx[.]Loader[.]policy|SHA256SUMS|BUILD_MANIFEST)$")) | .browser_download_url' \
     "$scx_json" > "$scx_work/urls.txt"
 
   grep -q 'SHA256SUMS' "$scx_work/urls.txt" || { echo "error: no SHA256SUMS asset in $scx_tag"; return 1; }
@@ -345,6 +345,17 @@ install_scx_from_release() {
       [ -f "$b" ] || { echo "error: $b missing from $scx_tag assets"; exit 1; }
       install -Dm755 "$b" "/usr/local/bin/$b"
     done
+    # scx_loader (DBus scheduler loader) + scxctl (CLI) + their systemd/DBus/polkit files.
+    # Guarded so older scx-* releases without them still install cleanly.
+    if [ -f scx_loader ] && [ -f scxctl ]; then
+      install -Dm755 scx_loader "/usr/local/bin/scx_loader"
+      install -Dm755 scxctl     "/usr/local/bin/scxctl"
+      [ -f scx_loader.service ]     && install -Dm644 scx_loader.service     /etc/systemd/system/scx_loader.service
+      [ -f org.scx.Loader.service ] && install -Dm644 org.scx.Loader.service /usr/share/dbus-1/system-services/org.scx.Loader.service
+      [ -f org.scx.Loader.conf ]    && install -Dm644 org.scx.Loader.conf    /usr/share/dbus-1/system.d/org.scx.Loader.conf
+      [ -f org.scx.Loader.policy ]  && install -Dm644 org.scx.Loader.policy  /usr/share/polkit-1/actions/org.scx.Loader.policy
+      echo "installed scx_loader + scxctl control plane"
+    fi
   ) || return 1
 
   echo "$scx_tag" > "$LAST_SCX_TAG_FILE"
@@ -466,9 +477,19 @@ if systemctl cat scx_loader.service >/dev/null 2>&1; then
 default_sched = "scx_flash"
 default_mode  = "Server"
 SCX_CFG
+  systemctl reload dbus 2>/dev/null || true   # apply org.scx.Loader.conf policy (reload, not restart)
   systemctl daemon-reload
-  systemctl enable --now scx_loader.service || true
-  systemctl disable nuc16pro-scx-server.service 2>/dev/null || true
+  # Release sched_ext from the direct service before scx_loader attaches (only one
+  # scheduler can attach at a time), then hand over. If scx_loader fails to come up,
+  # fall back to the direct service so the box never lands on no scheduler.
+  systemctl stop nuc16pro-scx-server.service 2>/dev/null || true
+  if systemctl enable --now scx_loader.service && systemctl is-active --quiet scx_loader.service; then
+    systemctl disable nuc16pro-scx-server.service 2>/dev/null || true
+    echo "scx_loader active (scxctl available)"
+  else
+    echo "warn: scx_loader.service failed to start; reverting to direct scx service"
+    systemctl enable --now nuc16pro-scx-server.service || true
+  fi
 else
   systemctl enable --now nuc16pro-scx-server.service || true
 fi

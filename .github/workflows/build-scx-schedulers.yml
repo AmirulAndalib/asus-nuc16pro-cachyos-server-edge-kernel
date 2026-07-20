@@ -116,8 +116,11 @@ jobs:
           test -f dist/SHA256SUMS
           test -f dist/BUILD_MANIFEST
 
-          for b in scx_bpfland scx_p2dq scx_rusty scx_beerland scx_lavd; do
+          for b in scx_flash scx_bpfland scx_p2dq scx_rusty scx_beerland scx_lavd scx_loader scxctl; do
             test -x "dist/$b" || { echo "error: dist/$b missing or not executable"; exit 1; }
+          done
+          for f in scx_loader.service org.scx.Loader.service org.scx.Loader.conf org.scx.Loader.policy; do
+            test -f "dist/$f" || { echo "error: dist/$f missing"; exit 1; }
           done
 
           {
@@ -190,15 +193,17 @@ jobs:
           - Build timestamp: \`${BUILD_DATE_UTC}\`
           - Workflow run: ${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}
 
-          ### Not included
+          ### Control plane
 
-          \`scx_loader\`/\`scxctl\` live in the separate sched-ext/scx-loader
-          repo and are not built by this workflow. The device's start script
-          already runs schedulers directly when scx_loader is absent.
+          \`scx_loader\` + \`scxctl\` are built from sched-ext/scx-loader (tag-matched
+          to scx) and shipped with their systemd unit, DBus activation/policy, and
+          polkit action, patched to \`/usr/local/bin\`. The updater installs and enables
+          \`scx_loader.service\` (default \`scx_flash\` in Server mode); the direct
+          \`nuc16pro-scx-server.service\` stays the fallback if scx_loader is absent.
           NOTES_EOF
 
           gh release create "$TAG" \
-            dist/scx_* dist/SHA256SUMS dist/BUILD_MANIFEST \
+            dist/scx_* dist/scxctl dist/org.scx.Loader.* dist/SHA256SUMS dist/BUILD_MANIFEST \
             --title "$TITLE" \
             --notes-file /tmp/release-notes.md
 
