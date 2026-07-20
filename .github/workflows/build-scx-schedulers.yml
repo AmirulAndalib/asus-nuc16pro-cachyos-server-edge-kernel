@@ -1,4 +1,4 @@
-name: Build scx schedulers (sched-ext/scx)
+name: Build scx schedulers + loader (sched-ext/scx)
 
 on:
   workflow_dispatch:
@@ -25,7 +25,7 @@ concurrency:
 
 jobs:
   build:
-    name: Build scx_bpfland/p2dq/rusty/beerland/lavd for ASUS NUC 16 Pro
+    name: Build scx schedulers + scx_loader/scxctl for ASUS NUC 16 Pro
     runs-on: ubuntu-latest
     timeout-minutes: 60
 
