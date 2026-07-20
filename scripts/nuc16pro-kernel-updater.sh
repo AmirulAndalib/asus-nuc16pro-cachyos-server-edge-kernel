@@ -338,6 +338,11 @@ After=multi-user.target
 [Service]
 Type=oneshot
 RemainAfterExit=yes
+# msr: lets turbostat read per-core MHz / package watts for diagnostics. Non-fatal.
+# (Uncore/mesh frequency pinning was evaluated and dropped: this Panther Lake mobile SoC
+# exposes intel_uncore_frequency sysfs but ignores min_freq_khz writes - HWP owns uncore
+# scaling here - so a pin is inert. HWP already ramps uncore under load.)
+ExecStartPre=-/sbin/modprobe msr
 # Power limits (PL1/PL2/Tau) are deliberately NOT written here. The 356H is hard-capped
 # at its 80W Maximum Turbo Power (Intel spec), confirmed on-device (package stays <=80W
 # under stress even with RAPL raised to 104W). A write above 80W is inert and below it
@@ -905,17 +910,23 @@ done
 # z3fold module absent). Omitting it uses the compiled default zsmalloc, which has the best
 # density anyway. zswap.zpool stays in the dedup list below so the stale z3fold token is
 # stripped from any existing /etc/default/grub on the next update.
-GRUB_CMDLINE_ADD="threadirqs usbcore.autosuspend=-1 nvme_core.default_ps_max_latency_us=0 zswap.enabled=1 zswap.shrinker_enabled=1 zswap.compressor=zstd zswap.max_pool_percent=20 mitigations=auto intel_pstate=active preempt=lazy"
+# tsc=reliable: skip the clocksource watchdog - TSC here is constant/nonstop/known-freq.
+# nmi_watchdog=0: free the per-core perf counter the hard-lockup detector holds; a headless
+#   server does not need NMI lockup detection. mitigations stays =auto (internet-exposed).
+# splash is stripped below (not re-added): the plymouth splash starves multi-user.target on
+#   this headless box, delaying the tuning oneshots.
+GRUB_CMDLINE_ADD="threadirqs usbcore.autosuspend=-1 nvme_core.default_ps_max_latency_us=0 zswap.enabled=1 zswap.shrinker_enabled=1 zswap.compressor=zstd zswap.max_pool_percent=20 mitigations=auto intel_pstate=active preempt=lazy tsc=reliable nmi_watchdog=0"
 
 if grep -q '^GRUB_CMDLINE_LINUX_DEFAULT=' /etc/default/grub; then
   CURRENT="$(grep '^GRUB_CMDLINE_LINUX_DEFAULT=' /etc/default/grub | \
     sed -E 's/^GRUB_CMDLINE_LINUX_DEFAULT="(.*)"/\1/')"
 
-  # Remove stale Lenovo/Tiger Lake params and any we're about to re-add
+  # Remove stale Lenovo/Tiger Lake params and any we're about to re-add. 'splash' is in the
+  # list but NOT in GRUB_CMDLINE_ADD, so it is stripped and stays gone (headless plymouth fix).
   for param in i915.enable_guc threadirqs usbcore.autosuspend nvme_core.default_ps_max_latency_us \
                zswap.enabled zswap.shrinker_enabled zswap.compressor \
                zswap.max_pool_percent zswap.zpool rcutree.enable_rcu_lazy \
-               mitigations intel_pstate preempt; do
+               mitigations intel_pstate preempt tsc nmi_watchdog splash; do
     CURRENT="$(echo "$CURRENT" | sed -E "s/(^| )${param}=[^ ]+//g; s/(^| )${param}( |$)/ /g")"
   done
 

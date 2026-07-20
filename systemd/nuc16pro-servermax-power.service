@@ -5,6 +5,11 @@ After=multi-user.target
 [Service]
 Type=oneshot
 RemainAfterExit=yes
+# msr: lets turbostat read per-core MHz / package watts for diagnostics. Non-fatal.
+# (Uncore/mesh frequency pinning was evaluated and dropped: this Panther Lake mobile SoC
+# exposes intel_uncore_frequency sysfs but ignores min_freq_khz writes - HWP owns uncore
+# scaling here - so a pin is inert. HWP already ramps uncore under load.)
+ExecStartPre=-/sbin/modprobe msr
 # Power limits (PL1/PL2/Tau) are deliberately NOT written here. The 356H is hard-capped
 # at its 80W Maximum Turbo Power (Intel spec), confirmed on-device (package stays <=80W
 # under stress even with RAPL raised to 104W). A write above 80W is inert and below it
