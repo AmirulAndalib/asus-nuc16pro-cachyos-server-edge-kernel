@@ -64,6 +64,27 @@ else
   flag "host iHD VA-API driver absent (host-side hardware transcode unavailable)"
 fi
 
+sec remote-desktop
+if systemctl cat gnome-remote-desktop.service >/dev/null 2>&1; then
+  note "gnome-remote-desktop: $(systemctl is-active gnome-remote-desktop.service 2>/dev/null)"
+  # Xe3 workaround: RDP --handover daemon SIGSEGVs in the Intel Vulkan driver unless
+  # pinned to software Vulkan (lavapipe). Flag if that pin ever disappears (regression).
+  if grep -qs 'lvp_icd' /etc/environment /etc/systemd/system/gnome-remote-desktop.service.d/*.conf; then
+    note "RDP software-Vulkan workaround: present"
+  else
+    flag "RDP software-Vulkan workaround missing (Xe3 RDP handover will SIGSEGV)"
+  fi
+  bt=$(date -d "$(uptime -s)" +%s 2>/dev/null || echo 0)
+  nc=0
+  for f in /var/crash/_usr_libexec_gnome-remote-desktop-daemon.*.crash; do
+    [ -e "$f" ] || continue
+    [ "$(stat -c %Y "$f" 2>/dev/null || echo 0)" -gt "$bt" ] && nc=$((nc + 1))
+  done
+  [ "$nc" -eq 0 ] && note "no RDP daemon crashes since boot" || flag "gnome-remote-desktop crashed $nc time(s) since boot"
+else
+  note "gnome-remote-desktop: not installed"
+fi
+
 sec network
 if [ -d /sys/class/net/bond0 ]; then
   mode=$(cat /sys/class/net/bond0/bonding/mode 2>/dev/null)

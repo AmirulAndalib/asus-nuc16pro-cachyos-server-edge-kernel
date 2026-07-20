@@ -93,9 +93,11 @@ msg "ensuring media (VA-API) + diagnostic userspace"
 # the whole install (apt validates the full package list up front, so one missing name kills it).
 # GSC firmware loads kernel-side from xe/ptl_gsc_1.bin regardless of this userspace package.
 # smartmontools + nvme-cli back the post-boot health-check's drive-SMART section.
+# mesa-vulkan-drivers ships the lavapipe (lvp_icd.json) software Vulkan ICD that the
+# RDP software-Vulkan workaround below pins gnome-remote-desktop to on Xe3.
 apt-get install -y \
   intel-media-va-driver-non-free libigdgmm12 libmfx-gen1.2 libvpl-tools vainfo \
-  smartmontools nvme-cli \
+  smartmontools nvme-cli mesa-vulkan-drivers \
   || echo "warn: some media/diagnostic packages unavailable on this release, continuing"
 
 msg "fetching latest release"
@@ -698,6 +700,27 @@ else
   flag "host iHD VA-API driver absent (host-side hardware transcode unavailable)"
 fi
 
+sec remote-desktop
+if systemctl cat gnome-remote-desktop.service >/dev/null 2>&1; then
+  note "gnome-remote-desktop: $(systemctl is-active gnome-remote-desktop.service 2>/dev/null)"
+  # Xe3 workaround: RDP --handover daemon SIGSEGVs in the Intel Vulkan driver unless
+  # pinned to software Vulkan (lavapipe). Flag if that pin ever disappears (regression).
+  if grep -qs 'lvp_icd' /etc/environment /etc/systemd/system/gnome-remote-desktop.service.d/*.conf; then
+    note "RDP software-Vulkan workaround: present"
+  else
+    flag "RDP software-Vulkan workaround missing (Xe3 RDP handover will SIGSEGV)"
+  fi
+  bt=$(date -d "$(uptime -s)" +%s 2>/dev/null || echo 0)
+  nc=0
+  for f in /var/crash/_usr_libexec_gnome-remote-desktop-daemon.*.crash; do
+    [ -e "$f" ] || continue
+    [ "$(stat -c %Y "$f" 2>/dev/null || echo 0)" -gt "$bt" ] && nc=$((nc + 1))
+  done
+  [ "$nc" -eq 0 ] && note "no RDP daemon crashes since boot" || flag "gnome-remote-desktop crashed $nc time(s) since boot"
+else
+  note "gnome-remote-desktop: not installed"
+fi
+
 sec network
 if [ -d /sys/class/net/bond0 ]; then
   mode=$(cat /sys/class/net/bond0/bonding/mode 2>/dev/null)
@@ -795,6 +818,46 @@ HC_TIMER
 systemctl daemon-reload
 systemctl enable nuc16pro-healthcheck.timer || true
 systemctl start nuc16pro-healthcheck.timer || true
+
+msg "installing RDP software-Vulkan workaround (Panther Lake Xe3)"
+# gnome-remote-desktop's RDP --handover daemon SIGSEGVs inside the Intel Mesa Vulkan
+# driver (libvulkan_intel.so) on Xe3 while setting up the PipeWire capture pipeline:
+# auth succeeds, the session daemon dies, the client sees a black screen and drops.
+# GRD 50 has no gsettings/env switch to disable its Vulkan stage, so force its Vulkan
+# onto the software rasteriser (lavapipe). Applied only where g-r-d is installed.
+if systemctl cat gnome-remote-desktop.service >/dev/null 2>&1; then
+  install -Dm644 /dev/stdin /etc/systemd/system/gnome-remote-desktop.service.d/10-software-vulkan.conf <<'GRD_VK'
+# Panther Lake (Xe3) workaround for GNOME Remote Desktop RDP.
+#
+# gnome-remote-desktop's per-session RDP daemon (gnome-remote-desktop-daemon
+# --handover) SIGSEGVs inside the Intel Mesa Vulkan driver (libvulkan_intel.so)
+# while building the PipeWire screen-capture pipeline on this Xe3 iGPU. The RDP
+# client authenticates, the session daemon dies mid-startup, the client sees a
+# black screen and is dropped. GRD 50 exposes no gsettings/env switch to disable
+# its Vulkan colour-convert stage, so pin its Vulkan loader to the software
+# rasteriser (lavapipe): the crashing Intel ICD is then never loaded by GRD.
+#
+# VA-API hardware transcode is unaffected - it uses the iHD driver via libva, a
+# different stack from the Vulkan loader. Cost is CPU-side colour conversion; the
+# H.264 encode stays on the GPU. Remove this drop-in (and the matching lines in
+# /etc/environment) once Mesa ANV / kernel xe stabilise for Xe3, to regain
+# GPU-accelerated conversion.
+[Service]
+Environment=VK_DRIVER_FILES=/usr/share/vulkan/icd.d/lvp_icd.json
+Environment=VK_ICD_FILENAMES=/usr/share/vulkan/icd.d/lvp_icd.json
+GRD_VK
+  # /etc/environment (pam_env) also carries it into the GDM-spawned handover session,
+  # which runs under a GDM dynamic user rather than the system service's environment.
+  for kv in \
+    "VK_DRIVER_FILES=/usr/share/vulkan/icd.d/lvp_icd.json" \
+    "VK_ICD_FILENAMES=/usr/share/vulkan/icd.d/lvp_icd.json"; do
+    grep -q "^${kv%%=*}=" /etc/environment 2>/dev/null || echo "$kv" >> /etc/environment
+  done
+  systemctl daemon-reload
+  systemctl try-restart gnome-remote-desktop.service || true
+else
+  echo "gnome-remote-desktop not present; skipping RDP Vulkan workaround"
+fi
 
 msg "applying sysctl and udev"
 sysctl --system       || true
