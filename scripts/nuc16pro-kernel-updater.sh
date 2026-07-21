@@ -469,6 +469,35 @@ install_scx_from_release() {
       [ -f org.scx.Loader.service ] && install -Dm644 org.scx.Loader.service /usr/share/dbus-1/system-services/org.scx.Loader.service
       [ -f org.scx.Loader.conf ]    && install -Dm644 org.scx.Loader.conf    /usr/share/dbus-1/system.d/org.scx.Loader.conf
       [ -f org.scx.Loader.policy ]  && install -Dm644 org.scx.Loader.policy  /usr/share/polkit-1/actions/org.scx.Loader.policy
+      # Boot-order drop-in: attach scx_flash before the docker container storm (the
+      # guarantee the direct nuc16pro-scx-server.service carried). Kept as a .d/
+      # override because the line above overwrites the upstream unit each run.
+      install -Dm644 /dev/stdin /etc/systemd/system/scx_loader.service.d/10-nuc16pro-boot-order.conf <<'SCX_ORDER'
+# Drop-in for scx_loader.service (installed to
+# /etc/systemd/system/scx_loader.service.d/10-nuc16pro-boot-order.conf).
+#
+# Kept separate from the upstream unit because the updater overwrites
+# /etc/systemd/system/scx_loader.service from the scx-* release asset on every run;
+# a drop-in survives that and systemd merges After=/Before= additively.
+[Unit]
+# Attach the sched_ext scheduler before dockerd launches the container fleet, the
+# same guarantee the direct nuc16pro-scx-server.service carried before scx_loader
+# took over. scx_loader is gated only on dbus.socket + basic.target, so it comes up
+# ~6-7s into boot and attaches scx_flash ahead of docker.service, which waits on
+# network-online.target (~13-14s in) before starting ~47 containers. Attaching
+# pre-storm avoids the boot-time ops.cgroup_init() -ENOMEM that hit the old late
+# (~68s, mid-storm) attach. SOFT order (scx_loader is Type=dbus, marked started at
+# bus-name acquisition, not at scheduler-attach), but flash wins by margin in
+# practice: measured flash 7.1s vs docker 13.7s on this box.
+After=basic.target
+Before=docker.service
+
+[Service]
+# Upstream ships Restart=no. Bring the loader back if the daemon dies so the box
+# never sits with no control plane, matching the direct unit's on-failure policy.
+Restart=on-failure
+RestartSec=10
+SCX_ORDER
       echo "installed scx_loader + scxctl control plane"
     fi
   ) || return 1
