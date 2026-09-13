@@ -99,7 +99,7 @@ jobs:
           if [ "$FORCE_BUILD" = "true" ]; then
             echo "FORCE: skipping version check, building regardless"
             echo "skip=false" >> "$GITHUB_OUTPUT"
-          elif echo "$RECENT" | grep -q "v${KVER}-cachyos-servermax-x86_64v3-"; then
+          elif echo "$RECENT" | grep -qE "v${KVER}-cachyos-servermax-(nuc16pro-)?x86_64v3-"; then
             echo "SKIP: $KVER already has a servermax release."
             echo "skip=true" >> "$GITHUB_OUTPUT"
             {
@@ -355,7 +355,7 @@ jobs:
           BUILD_DATE_NODASH="$(date -u +%Y%m%d)"
           CHECKSUMS="$(cat dist/SHA256SUMS)"
 
-          TAG="v${KERNEL_VERSION}-cachyos-servermax-x86_64v3-${BUILD_DATE_NODASH}.${GITHUB_RUN_NUMBER}"
+          TAG="v${KERNEL_VERSION}-cachyos-servermax-nuc16pro-x86_64v3-${BUILD_DATE_NODASH}.${GITHUB_RUN_NUMBER}"
           TITLE="Linux ${KERNEL_VERSION} • CachyOS ServerMax • ASUS NUC 16 Pro • ${BUILD_DATE}"
 
           PRERELEASE_OPTS=()

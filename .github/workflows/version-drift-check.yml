@@ -3,20 +3,43 @@ name: Version drift check (kernel + scx vs upstream latest)
 # The whole pipeline is built on "always latest, never pinned": the kernel build resolves
 # the current linux-cachyos PKGBUILD and the scx build resolves sched-ext/scx's latest
 # release at build time. Nothing in the repo pins a runtime version. The failure mode that
-# creates is silent staleness - if a build workflow stops firing, or an upstream release
+# creates is silent staleness: if a build workflow stops firing, or an upstream release
 # lands and nothing rebuilds, the box quietly drifts behind and there is no signal anywhere.
 #
 # This job is that signal. It compares what this repo has actually released against what
-# upstream currently ships, and goes red when they diverge, so the badge in the README is a
-# live statement about currency rather than a claim.
+# the pipeline's REAL build input currently ships, and goes red when they diverge.
+#
+# Which upstream counts, and why it matters:
+#   - The kernel here is NOT built from a kernel.org tarball. scripts/build-cachyos-server.sh
+#     clones CachyOS/linux-cachyos and sources the linux-cachyos-server PKGBUILD for pkgver.
+#     So the only version this pipeline can actually act on is the CachyOS PKGBUILD version.
+#     That is the comparison that decides pass or fail.
+#   - kernel.org stable is still reported, because CachyOS lagging mainline is worth seeing.
+#     It is context, not a failure condition: nothing in this repo can make CachyOS rebase
+#     faster, so failing on it would be an alarm nobody can clear.
 #
 # A red result right after an upstream release is expected and self-healing: it means
-# upstream moved and the corresponding build workflow has not produced a release yet.
+# CachyOS moved and the build workflow has not produced a release yet.
 
 on:
   schedule:
-    # 06:15 UTC daily. Offset off the hour so it is not competing with everyone else's cron.
-    - cron: '15 6 * * *'
+    # Every 4 hours, offset to land AFTER the build windows rather than before them.
+    # Builds: build-cachyos-server 09:00 UTC, build-cachyos-server-oracle 21:00 UTC,
+    # build-scx-schedulers 03:00 UTC. A kernel build takes well over an hour, so the
+    # 03:00/07:00/11:00/15:00/19:00/23:00 grid puts a check ~2h after each build starts.
+    - cron: '0 3-23/4 * * *'
+  # Real coupling: cron alone cannot guarantee the check runs after a build finishes, it
+  # only bounds staleness at 4 hours. workflow_run fires the check the moment a build
+  # workflow completes (success or failure), so a fresh release is evaluated immediately.
+  workflow_run:
+    # These MUST match the `name:` of each build workflow exactly. GitHub silently never
+    # fires a workflow_run trigger that names a workflow it cannot resolve, so a typo here
+    # degrades the check back to cron-only with no error anywhere.
+    workflows:
+      - Build ASUS NUC 16 Pro CachyOS ServerMax Kernel
+      - Build ASUS NUC 16 Pro CachyOS ServerMax Kernel (Oracle A1 ARM64 cross)
+      - Build scx schedulers + loader (sched-ext/scx)
+    types: [completed]
   workflow_dispatch: {}
 
 permissions:
@@ -33,6 +56,10 @@ jobs:
     timeout-minutes: 10
     env:
       GH_TOKEN: ${{ github.token }}
+      # Must match what both build workflows pass to build-cachyos-server.sh. If the build
+      # ever switches variant (linux-cachyos-rc, say), change it here in the same commit or
+      # this check silently compares against a variant nobody builds.
+      CACHY_VARIANT: linux-cachyos-server
 
     steps:
       - name: Checkout
@@ -43,17 +70,30 @@ jobs:
         run: |
           set -euo pipefail
 
-          # --- upstream: latest mainline/stable kernel, straight from kernel.org ---------
-          # finger_banner is the canonical plain-text source and has no rate limit or auth.
-          BANNER="$(curl -fsSL --retry 3 --retry-delay 5 https://www.kernel.org/finger_banner)"
-          UPSTREAM_KERNEL="$(printf '%s\n' "$BANNER" \
-            | sed -n 's/^The latest stable version of the Linux kernel is: *//p' \
-            | head -1)"
-          if [ -z "$UPSTREAM_KERNEL" ]; then
-            echo "::error::could not parse the latest stable kernel version from kernel.org/finger_banner"
-            printf '%s\n' "$BANNER"
+          # --- upstream that DECIDES: the CachyOS PKGBUILD the build actually consumes ---
+          # Read the raw PKGBUILD instead of sourcing it. The build script sources it because
+          # it needs the full package environment; a read-only check has no reason to execute
+          # third-party shell, so grep the two fields that compose pkgver.
+          PKGBUILD_URL="https://raw.githubusercontent.com/CachyOS/linux-cachyos/master/${CACHY_VARIANT}/PKGBUILD"
+          PKGBUILD="$(curl -fsSL --retry 3 --retry-delay 5 "$PKGBUILD_URL")"
+          CACHY_MAJOR="$(printf '%s\n' "$PKGBUILD" | sed -n 's/^_major=[\"'\'']*\([0-9.]*\).*/\1/p' | head -1)"
+          CACHY_MINOR="$(printf '%s\n' "$PKGBUILD" | sed -n 's/^_minor=[\"'\'']*\([0-9]*\).*/\1/p' | head -1)"
+          if [ -z "$CACHY_MAJOR" ]; then
+            echo "::error::could not parse _major from $PKGBUILD_URL - CachyOS may have changed the PKGBUILD layout"
+            printf '%s\n' "$PKGBUILD" | head -40
             exit 1
           fi
+          # linux-cachyos-rc carries _minor=0 for an x.y.0 line; treat a missing _minor as 0
+          # rather than failing, but a missing _major is a real parse break.
+          UPSTREAM_KERNEL="${CACHY_MAJOR}.${CACHY_MINOR:-0}"
+
+          # --- upstream reported for CONTEXT: kernel.org latest stable --------------------
+          # finger_banner is the canonical plain-text source and has no rate limit or auth.
+          BANNER="$(curl -fsSL --retry 3 --retry-delay 5 https://www.kernel.org/finger_banner)"
+          MAINLINE_KERNEL="$(printf '%s\n' "$BANNER" \
+            | sed -n 's/^The latest stable version of the Linux kernel is: *//p' \
+            | head -1)"
+          [ -n "$MAINLINE_KERNEL" ] || MAINLINE_KERNEL='unknown'
 
           # --- upstream: latest sched-ext/scx release -----------------------------------
           UPSTREAM_SCX="$(gh api repos/sched-ext/scx/releases/latest --jq '.tag_name')"
@@ -61,27 +101,37 @@ jobs:
 
           # --- ours: newest kernel release and newest scx release in this repo ----------
           # Kernel releases are tagged vX.Y.Z-cachyos-...; scx releases are tagged scx-vX.Y.Z-...
-          RELEASES="$(gh release list --repo "$GITHUB_REPOSITORY" --limit 100 --json tagName,createdAt \
-            --jq '.[] | [.tagName, .createdAt] | @tsv')"
+          # Pick by VERSION, not by list order: several releases can share a createdAt
+          # timestamp (a batch publish), and ordering between ties is not guaranteed, so
+          # trusting row order can report drift that does not exist.
+          # The tag pattern tolerates both the current
+          # vX.Y.Z-cachyos-servermax-nuc16pro-x86_64v3-... form and the older tags that
+          # omit the nuc16pro- segment, so previously published releases still resolve.
+          # RC tags (vX.Y.rcN-...) are intentionally NOT matched: linux-cachyos-server
+          # always carries a stable pkgver, so comparing it to an RC build is meaningless.
+          # If only RC releases existed the kernel version resolves empty and the check
+          # goes red, which is the correct loud outcome rather than a silent pass.
+          RELEASES="$(gh release list --repo "$GITHUB_REPOSITORY" --limit 100 --json tagName --jq '.[].tagName')"
 
-          OURS_KERNEL_TAG="$(printf '%s\n' "$RELEASES" | awk -F'\t' '$1 ~ /^v[0-9]/ {print $1; exit}')"
-          OURS_SCX_TAG="$(printf '%s\n'   "$RELEASES" | awk -F'\t' '$1 ~ /^scx-/   {print $1; exit}')"
+          OURS_KERNEL="$(printf '%s\n' "$RELEASES" \
+            | sed -n 's/^v\([0-9][0-9.]*\)-cachyos.*/\1/p' | sort -V | tail -1)"
+          OURS_SCX="$(printf '%s\n' "$RELEASES" \
+            | sed -n 's/^scx-\(v[0-9][0-9.]*\).*/\1/p' | sort -V | tail -1)"
 
-          # vX.Y.Z-cachyos-edge-... -> X.Y.Z ; scx-vX.Y.Z-20260819.12 -> v1.1.3
-          OURS_KERNEL="$(printf '%s' "${OURS_KERNEL_TAG:-}" | sed -E 's/^v//; s/-cachyos.*//')"
-          OURS_SCX="$(printf '%s'    "${OURS_SCX_TAG:-}"    | sed -E 's/^scx-(v[0-9]+\.[0-9]+\.[0-9]+).*/\1/')"
+          OURS_KERNEL_TAG="$(printf '%s\n' "$RELEASES" | grep -F "v${OURS_KERNEL:-__none__}-cachyos" | head -1 || true)"
+          OURS_SCX_TAG="$(printf '%s\n' "$RELEASES" | grep -F "scx-${OURS_SCX:-__none__}" | head -1 || true)"
 
-          # kernel.org reports a .0 release as "7.2" while our tag carries "7.2.0".
-          # Normalise both to three components before comparing so that is not false drift.
+          # CachyOS writes a .0 release as _minor=0 giving "7.3.0" while a tag may carry
+          # "7.3". Normalise both to three components before comparing so that is not
+          # counted as drift.
           norm() { printf '%s' "$1" | awk -F. '{printf "%d.%d.%d", $1, ($2==""?0:$2), ($3==""?0:$3)}'; }
-          UPSTREAM_KERNEL_N="$(norm "$UPSTREAM_KERNEL")"
-          OURS_KERNEL_N="$(norm "${OURS_KERNEL:-0}")"
 
           {
             echo "upstream_kernel=$UPSTREAM_KERNEL"
-            echo "upstream_kernel_n=$UPSTREAM_KERNEL_N"
+            echo "upstream_kernel_n=$(norm "$UPSTREAM_KERNEL")"
+            echo "mainline_kernel=$MAINLINE_KERNEL"
             echo "ours_kernel=${OURS_KERNEL:-none}"
-            echo "ours_kernel_n=$OURS_KERNEL_N"
+            echo "ours_kernel_n=$(norm "${OURS_KERNEL:-0}")"
             echo "ours_kernel_tag=${OURS_KERNEL_TAG:-none}"
             echo "upstream_scx=$UPSTREAM_SCX"
             echo "upstream_scx_date=$UPSTREAM_SCX_DATE"
@@ -94,6 +144,7 @@ jobs:
           set -euo pipefail
           UK='${{ steps.resolve.outputs.upstream_kernel }}'
           UKN='${{ steps.resolve.outputs.upstream_kernel_n }}'
+          MK='${{ steps.resolve.outputs.mainline_kernel }}'
           OK='${{ steps.resolve.outputs.ours_kernel }}'
           OKN='${{ steps.resolve.outputs.ours_kernel_n }}'
           OKT='${{ steps.resolve.outputs.ours_kernel_tag }}'
@@ -101,6 +152,7 @@ jobs:
           USD='${{ steps.resolve.outputs.upstream_scx_date }}'
           OS='${{ steps.resolve.outputs.ours_scx }}'
           OST='${{ steps.resolve.outputs.ours_scx_tag }}'
+          CV='${{ env.CACHY_VARIANT }}'
 
           drift=0
           kernel_state='current'
@@ -108,20 +160,32 @@ jobs:
           [ "$UKN" = "$OKN" ] || { kernel_state='DRIFT'; drift=1; }
           [ "$US"  = "$OS"  ] || { scx_state='DRIFT';    drift=1; }
 
+          # Mainline lag is reported, never failed on. Nothing in this repo can make CachyOS
+          # rebase onto a newer stable, so a red check here would be an alarm with no fix.
+          lag='in step with mainline'
+          [ "$MK" = "$UK" ] || lag="CachyOS is behind kernel.org stable \`$MK\`"
+
           {
             echo "## Version currency"
             echo
             echo "| component | upstream latest | this repo released | state |"
             echo "| --- | --- | --- | --- |"
-            echo "| Linux kernel | \`$UK\` | \`$OK\` | $kernel_state |"
+            echo "| Linux kernel (CachyOS \`$CV\` PKGBUILD) | \`$UK\` | \`$OK\` | $kernel_state |"
             echo "| sched-ext/scx | \`$US\` | \`$OS\` | $scx_state |"
             echo
             echo "Newest kernel release tag: \`$OKT\`"
             echo "Newest scx release tag: \`$OST\`"
             echo "Upstream scx published: \`$USD\`"
             echo
+            echo "### kernel.org context (not a failure condition)"
+            echo
+            echo "kernel.org latest stable: \`$MK\` - $lag."
+            echo "The kernel here is built from the CachyOS \`$CV\` PKGBUILD, not from a"
+            echo "kernel.org tarball, so the PKGBUILD version above is what the pipeline can"
+            echo "actually track. Mainline is shown so CachyOS falling behind stays visible."
+            echo
             if [ "$drift" = 0 ]; then
-              echo "Both components match upstream latest. Nothing pinned, nothing stale."
+              echo "Both components match their upstream. Nothing pinned, nothing stale."
             else
               echo "Drift detected. This is expected for a short window after an upstream"
               echo "release and clears itself once the matching build workflow publishes a"
@@ -131,8 +195,8 @@ jobs:
           } >> "$GITHUB_STEP_SUMMARY"
 
           if [ "$drift" != 0 ]; then
-            [ "$kernel_state" = 'current' ] || echo "::error title=Kernel drift::upstream stable is $UK but the newest release here is $OK"
+            [ "$kernel_state" = 'current' ] || echo "::error title=Kernel drift::CachyOS $CV PKGBUILD is $UK but the newest release here is $OK"
             [ "$scx_state"    = 'current' ] || echo "::error title=scx drift::upstream latest is $US but the newest release here is $OS"
             exit 1
           fi
-          echo "kernel $OK and scx $OS both match upstream latest"
+          echo "kernel $OK matches CachyOS $CV ($UK); scx $OS matches upstream latest"

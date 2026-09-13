@@ -6,13 +6,26 @@
 [![updater in sync](https://github.com/AmirulAndalib/asus-nuc16pro-cachyos-server-edge-kernel/actions/workflows/check-kernel-updater-sync.yml/badge.svg)](https://github.com/AmirulAndalib/asus-nuc16pro-cachyos-server-edge-kernel/actions/workflows/check-kernel-updater-sync.yml)
 
 [![latest release](https://img.shields.io/github/v/release/AmirulAndalib/asus-nuc16pro-cachyos-server-edge-kernel?sort=date&label=latest%20build&color=blue)](https://github.com/AmirulAndalib/asus-nuc16pro-cachyos-server-edge-kernel/releases/latest)
+[![upstream cachyos](https://img.shields.io/badge/dynamic/regex?url=https%3A%2F%2Fraw.githubusercontent.com%2FCachyOS%2Flinux-cachyos%2Fmaster%2Flinux-cachyos-server%2FPKGBUILD&search=_major%3D%28%5B0-9.%5D%2B%29%5B%5Cs%5CS%5D*%3F_minor%3D%28%5B0-9%5D%2B%29&replace=%241.%242&label=upstream%20cachyos&color=green)](https://github.com/CachyOS/linux-cachyos/blob/master/linux-cachyos-server/PKGBUILD)
 [![upstream scx](https://img.shields.io/github/v/release/sched-ext/scx?label=upstream%20scx&color=orange)](https://github.com/sched-ext/scx/releases/latest)
+[![kernel.org stable](https://img.shields.io/badge/dynamic/regex?url=https%3A%2F%2Fwww.kernel.org%2Ffinger_banner&search=latest%20stable%20version%20of%20the%20Linux%20kernel%20is%3A%5Cs*%28%5B0-9.%5D%2B%29&replace=%241&label=kernel.org%20stable&color=lightgrey)](https://www.kernel.org/)
 [![release date](https://img.shields.io/github/release-date/AmirulAndalib/asus-nuc16pro-cachyos-server-edge-kernel?label=built&color=informational)](https://github.com/AmirulAndalib/asus-nuc16pro-cachyos-server-edge-kernel/releases)
 
-The **version drift** badge is the one that matters for a no-pinning pipeline: it goes red when
-the newest kernel release here stops matching kernel.org's latest stable, or when the newest
-scx release here stops matching `sched-ext/scx`'s latest tag. Green means nothing has gone
-stale behind your back. See [`version-drift-check.yml`](.github/workflows/version-drift-check.yml).
+The **version drift** badge is the one that matters for a no-pinning pipeline. It goes red when
+the newest kernel release here stops matching the CachyOS `linux-cachyos-server` PKGBUILD, which
+is the version this pipeline actually builds from, or when the newest scx release here stops
+matching `sched-ext/scx`'s latest tag. kernel.org stable is reported alongside it as context so
+CachyOS falling behind mainline stays visible, but it is not a failure condition: nothing here
+can make CachyOS rebase. Green means nothing has gone stale behind your back. The check runs
+every 4 hours and again the moment any build workflow completes. See
+[`version-drift-check.yml`](.github/workflows/version-drift-check.yml) and
+[the correction that produced this behaviour](docs/TUNING-FINDINGS.md#14-drift-check-corrected-2026-09-13).
+
+Reading the version badges: **latest build** should equal **upstream cachyos**, which is read
+live from the `linux-cachyos-server` PKGBUILD and is the only kernel version this pipeline can
+act on. **upstream scx** should equal the newest `scx-` release here. **kernel.org stable** is
+informational: it shows how far CachyOS trails mainline, and it is normal for it to sit one
+patch release ahead.
 
 Bleeding-edge [CachyOS](https://github.com/CachyOS/linux-cachyos) kernel pipeline for the ASUS NUC 16 Pro (Intel Core Ultra 7 356H / Panther Lake), tuned for AC-powered server/homelab workloads.
 
@@ -20,65 +33,124 @@ Tracks `linux-cachyos-server`, CachyOS stable server variant with server-optimiz
 
 ## Target System
 
-| Field          | Value                                                                          |
-| -------------- | ------------------------------------------------------------------------------ |
-| Machine        | ASUS NUC 16 Pro                                                                |
-| CPU            | Intel Core Ultra 7 356H / Panther Lake (4P+8E+4LP-E, 16C/16T, no HT)         |
-| Process        | Intel 18A (CPU die), Intel 3 (GPU die)                                         |
-| iGPU           | Intel Xe3 LP (`xe` driver, device 0xB0A0, 4 Xe3-cores, 2.45 GHz)             |
-| NPU            | Intel NPU 50 TOPS (`intel_vpu` / IVPU driver, 5th Gen, vpu_50xx firmware)     |
-| Ethernet       | Dual Intel I226-V 2.5GbE (`igc` driver)                                       |
-| WiFi           | Intel Wi-Fi 7 BE211 (`iwlwifi` + `iwlmvm`, 320 MHz, MLO, BT 6.0)             |
-| Storage        | 2x NVMe; measured link: Crucial P310 Gen4 x4, Micron 2200 Gen3 x4 (§11)      |
-| Memory         | DDR5 CSO-DIMM; fitted 2x16GB DDR5-4800 at 4800 MT/s, dual controller (§11)   |
-| Connectivity   | Thunderbolt 4 / USB4 x2, USB 3.2 Gen 2x2 (20 Gbps)                           |
-| Architecture   | x86-64-v3                                                                      |
-| Target OS      | Ubuntu 26.04 LTS (amd64)                                                       |
-| Kernel base    | [linux-cachyos-server](https://github.com/CachyOS/linux-cachyos)              |
-| Package format | Debian/Ubuntu `.deb`                                                           |
-| AC adapter     | 120W (19VDC, 6.32A)                                                            |
+| Field          | Value                                                                                                                            |
+| -------------- | -------------------------------------------------------------------------------------------------------------------------------- |
+| Machine        | ASUS NUC 16 Pro                                                                                                                  |
+| CPU            | Intel Core Ultra 7 356H / Panther Lake (4P+8E+4LP-E, 16C/16T, no HT)                                                             |
+| Process        | Intel 18A (CPU die), Intel 3 (GPU die)                                                                                           |
+| iGPU           | Intel Xe3 LP (`xe` driver, device 0xB0A0, 4 Xe3-cores, 2.45 GHz)                                                               |
+| NPU            | Intel NPU 50 TOPS (`intel_vpu` / IVPU driver, 5th Gen, vpu_50xx firmware)                                                      |
+| Ethernet       | Dual Intel I226-V 2.5GbE (`igc` driver)                                                                                        |
+| WiFi           | Intel Wi-Fi 7 BE211 (`iwlwifi` + `iwlmvm`, 320 MHz, MLO, BT 6.0)                                                             |
+| Storage        | 2x NVMe; measured link: Crucial P310 Gen4 x4, Micron 2200 Gen3 x4 ([audit](docs/TUNING-FINDINGS.md#11-hardware-ceiling-audit))    |
+| Memory         | DDR5 CSO-DIMM; fitted 2x16GB DDR5-4800 at 4800 MT/s, dual controller ([audit](docs/TUNING-FINDINGS.md#11-hardware-ceiling-audit)) |
+| Connectivity   | Thunderbolt 4 / USB4 x2, USB 3.2 Gen 2x2 (20 Gbps)                                                                               |
+| Architecture   | x86-64-v3                                                                                                                        |
+| Target OS      | Ubuntu 26.04 LTS (amd64)                                                                                                         |
+| Kernel base    | [linux-cachyos-server](https://github.com/CachyOS/linux-cachyos)                                                                  |
+| Package format | Debian/Ubuntu `.deb`                                                                                                            |
+| AC adapter     | 120W (19VDC, 6.32A)                                                                                                              |
 
 ## Kernel Profile
 
-| Setting                | Value                                                                        |
-| ---------------------- | ---------------------------------------------------------------------------- |
-| Base scheduler         | EEVDF (servermax profile)                                                    |
-| sched_ext              | Compiled in, `scx_flash` auto-starts before the docker fleet (unit ordered `After=basic.target Before=docker.service`, bounded retry on boot-storm ENOMEM; verifies attach, falls back to `scx_bpfland`) |
-| Compiler               | LLVM / Clang + LLD                                                           |
-| LTO                    | ThinLTO                                                                      |
-| CPU target             | x86-64-v3 (AVX2, BMI2, FMA, LZCNT)                                          |
-| Timer frequency        | 100 Hz                                                                       |
-| Preemption             | Lazy (throughput lean; RT-class IRQs preempt immediately)                                                        |
-| Transparent Huge Pages | always, **plus multi-size THP (mTHP) orders 16k/32k/64k enabled** (§10)       |
-| TCP congestion         | BBR (mainline)                                                               |
-| I/O scheduler          | ADIOS (SSDs/NVMe), BFQ (HDDs) via udev + `modules-load.d` (adios is `=m`)     |
-| Proactive reclaim      | None: DAMON_RECLAIM tried, reclaimed 0 bytes in 19h, dropped (§10)           |
-| KSM                    | Off, deliberately: measured negative `general_profit` here (§10)             |
-| dm-crypt               | `no_read_workqueue` + `no_write_workqueue` on all LUKS devices (§10)          |
-| Zswap                  | Enabled (zstd compressor, zsmalloc pool, **30%**, §10)                        |
-| Async I/O              | io_uring enabled                                                             |
-| Network offload        | TLS kernel offload, XDP sockets                                              |
-| Block layer            | NVMe multipath; kernel-default wbt + rq_affinity (fio showed no win, §10)    |
-| NVMe power states      | Disabled (`nvme_core.default_ps_max_latency_us=0`, Gen4/Gen5 max perf)       |
-| Network                | 2x 2.5GbE bonded (balance-xor, static LAG; §5); WiFi 7 failover; `rp_filter=2` loose                     |
-| GPU driver             | `xe` (Intel Xe3 LP Panther Lake, GuC auto-enabled); `i915` kept as fallback  |
-| Vulkan                 | **Software (lavapipe) by design** until Mesa >= 26.1.2; box has 26.0.8 (§13) |
-| VA-API                 | Hardware iHD 26.3.2, 45 profiles; separate stack, unaffected by §13          |
-| IRQ affinity           | `threadirqs`: spread IRQs across P/E/LP-E cores                              |
-| Cgroup v2              | Full stack (CFS_BANDWIDTH, all controllers)                                  |
-| CRIU                   | CHECKPOINT_RESTORE enabled                                                   |
-| PCIe                   | ASPM performance mode + PTM                                                  |
-| RCU lazy               | Disabled (AC-only, no power-saving bias)                                     |
-| BTF                    | Enabled (`/sys/kernel/btf/vmlinux` for scx tools)                           |
-| Debug info             | DWARF (toolchain default), required for BTF                                  |
-| CPU power limits       | BIOS-owned PL1/PL2/Tau; silicon caps at 80W MTP                              |
-| Fan control            | BIOS/firmware owns curves; OS does not set them                              |
-| USB autosuspend        | Disabled (`usbcore.autosuspend=-1`): full power all ports                    |
-| WiFi power save        | Disabled (`iwlwifi power_save=0`, `iwlmvm power_scheme=1`)                   |
-| energy_perf_bias       | 0 (no microarchitecture power-saving bias on any core)                       |
-| NVMe queue depth       | `nr_requests=1023` per namespace at boot                                     |
-| igc ring buffers       | rx=4096 tx=4096 on both I226-V 2.5GbE ports                              |
-| Thermal trip           | Passive trip at TjMax (100°C) - no software throttle before hardware PROCHOT |
+Everything below is what the box actually runs, not a wishlist. Rows carrying a link were
+established by measurement; the number behind them is in
+[`docs/TUNING-FINDINGS.md`](docs/TUNING-FINDINGS.md).
+
+### Build and scheduler
+
+| Setting         | Value                                                                                                                                                                                                                                         |
+| --------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Base scheduler  | EEVDF (servermax profile)                                                                                                                                                                                                                     |
+| sched_ext       | Compiled in (`CONFIG_SCHED_CLASS_EXT=y`), `scx_flash` auto-starts before the docker fleet (unit ordered `After=basic.target Before=docker.service`, bounded retry on boot-storm ENOMEM; verifies attach, falls back to `scx_bpfland`) |
+| Compiler        | LLVM / Clang + LLD                                                                                                                                                                                                                            |
+| LTO             | ThinLTO                                                                                                                                                                                                                                       |
+| CPU target      | x86-64-v3 (AVX2, BMI2, FMA, LZCNT). v4 is impossible on this silicon: no AVX-512 ([audit](docs/TUNING-FINDINGS.md#11-hardware-ceiling-audit))                                                                                                  |
+| Timer frequency | 100 Hz (`CONFIG_HZ_100`)                                                                                                                                                                                                                    |
+| Preemption      | Lazy (`preempt=lazy`, throughput lean; RT-class IRQs preempt immediately)                                                                                                                                                                   |
+| Cgroup v2       | Full stack (CFS_BANDWIDTH, all controllers)                                                                                                                                                                                                   |
+| CRIU            | CHECKPOINT_RESTORE enabled                                                                                                                                                                                                                    |
+| BTF             | Enabled (`/sys/kernel/btf/vmlinux` for scx tools)                                                                                                                                                                                           |
+| Debug info      | DWARF (toolchain default), required for BTF                                                                                                                                                                                                   |
+
+### Memory
+
+| Setting                | Value                                                                                                                                                  |
+| ---------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| Transparent Huge Pages | always,**plus multi-size THP (mTHP) orders 16k/32k/64k enabled** ([measured](docs/TUNING-FINDINGS.md#multi-size-thp-mthp-the-biggest-single-win)) |
+| mTHP shrinker          | `shrink_underused=1`: reclaim mostly-zero THPs instead of pinning the memory                                                                         |
+| MGLRU                  | Fully enabled (`0x0007`), the multi-generational LRU doing the cold-anon work                                                                        |
+| Zswap                  | Enabled at boot, zstd compressor, zsmalloc pool,**30%** pool ceiling, shrinker on ([measured](docs/TUNING-FINDINGS.md#smaller-items))             |
+| Proactive reclaim      | None. DAMON_RECLAIM tried, reclaimed 0 bytes in 19h, dropped ([measured](docs/TUNING-FINDINGS.md#smaller-items))                                        |
+| KSM                    | Off, deliberately: measured negative`general_profit` here ([measured](docs/TUNING-FINDINGS.md#tested-and-rejected))                                   |
+| Swappiness             | `vm.swappiness=10` (swap only under real pressure; zswap absorbs the rest)                                                                           |
+| Cache pressure         | `vm.vfs_cache_pressure=50` (keep dentry/inode cache for ~80 containers)                                                                              |
+| Dirty writeback        | `vm.dirty_background_ratio=5`, `vm.dirty_ratio=20`                                                                                                 |
+| Known ceiling          | RAM capacity is the box's real bottleneck, not a tunable ([audit](docs/TUNING-FINDINGS.md#11-hardware-ceiling-audit))                                   |
+
+### Storage and I/O
+
+| Setting           | Value                                                                                                                                                                         |
+| ----------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| I/O scheduler     | ADIOS (SSDs/NVMe), BFQ (HDDs) via udev +`modules-load.d` (adios is `=m`)                                                                                                  |
+| Block layer       | NVMe multipath; kernel-default wbt + rq_affinity (fio showed no win,[measured](docs/TUNING-FINDINGS.md#block-layer-tried-wbt-off-plus-rq_affinity2-measured-nothing-reverted)) |
+| NVMe queue depth  | `nr_requests=1023` per namespace at boot                                                                                                                                    |
+| NVMe power states | Disabled (`nvme_core.default_ps_max_latency_us=0`, Gen4/Gen5 max perf)                                                                                                      |
+| dm-crypt          | `no_read_workqueue` + `no_write_workqueue` on all LUKS devices ([measured](docs/TUNING-FINDINGS.md#dm-crypt-workqueue-bypass))                                             |
+| Async I/O         | io_uring enabled                                                                                                                                                              |
+| Filesystem        | `noatime` on the media data disks (box-local `fstab`, host-specific)                                                                                                      |
+| File handles      | `fs.file-max=2097152`                                                                                                                                                       |
+| inotify           | `max_user_watches=1048576`, `max_user_instances=1024` (the container fleet needs both raised)                                                                             |
+
+### Network
+
+| Setting             | Value                                                                         |
+| ------------------- | ----------------------------------------------------------------------------- |
+| TCP congestion      | BBR (mainline,`CONFIG_DEFAULT_TCP_CONG="bbr"`)                              |
+| Queueing discipline | `fq`, BBR's intended pacing partner                                         |
+| TCP Fast Open       | `net.ipv4.tcp_fastopen=3` (client and server)                               |
+| Socket buffers      | `rmem_max`/`wmem_max` 128MB, `tcp_rmem`/`tcp_wmem` autotuned to 128MB |
+| Backlog             | `net.core.netdev_max_backlog=16384`                                         |
+| Bonding             | 2x 2.5GbE bonded (balance-xor, static LAG; see section 5); WiFi 7 failover    |
+| Reverse path filter | `rp_filter=2` loose, required for asymmetric paths across bond0 + wlo1      |
+| igc ring buffers    | rx=4096 tx=4096 on both I226-V 2.5GbE ports                                   |
+| Network offload     | TLS kernel offload, XDP sockets                                               |
+| WiFi power save     | Disabled (`iwlwifi power_save=0`, `iwlmvm power_scheme=1`)                |
+
+### Graphics and media
+
+| Setting     | Value                                                                                                                                      |
+| ----------- | ------------------------------------------------------------------------------------------------------------------------------------------ |
+| GPU driver  | `xe` (Intel Xe3 LP Panther Lake, GuC auto-enabled); `i915` kept as fallback                                                            |
+| Vulkan      | **Software (lavapipe) by design** until Mesa >= 26.1.2; box has 26.0.8 ([why](docs/TUNING-FINDINGS.md#13-routine-checkup-2026-09-01)) |
+| VA-API      | Hardware iHD 26.3.2, 45 profiles; separate stack, unaffected by the Vulkan pin                                                             |
+| iGPU clocks | Unrestricted:`max_freq` == `rp0_freq` == 2450MHz ([audit](docs/TUNING-FINDINGS.md#11-hardware-ceiling-audit))                           |
+
+### Power, thermal, and interrupts
+
+| Setting          | Value                                                                                         |
+| ---------------- | --------------------------------------------------------------------------------------------- |
+| P-state driver   | `intel_pstate=active` (hardware-managed P-states / HWP)                                     |
+| CPU power limits | BIOS-owned PL1/PL2/Tau; silicon caps at 80W MTP                                               |
+| Fan control      | BIOS/firmware owns curves; the OS does not set them                                           |
+| energy_perf_bias | 0 (no microarchitecture power-saving bias on any core)                                        |
+| Uncore frequency | `intel_uncore_freq_control` built as a module for ring/fabric visibility                    |
+| RCU lazy         | Disabled (AC-only, no power-saving bias)                                                      |
+| IRQ affinity     | `threadirqs`: spread IRQs across P/E/LP-E cores                                             |
+| irqbalance       | Not installed: no P/E/LP-E awareness ([rejected](docs/TUNING-FINDINGS.md#tested-and-rejected)) |
+| USB autosuspend  | Disabled (`usbcore.autosuspend=-1`): full power on all ports                                |
+| PCIe             | ASPM performance mode + PTM                                                                   |
+| Timekeeping      | `tsc=reliable`: skip the clocksource watchdog on a known-good TSC                           |
+| Thermal trip     | Passive trip at TjMax (100C), no software throttle before hardware PROCHOT                    |
+
+### Security posture
+
+| Setting         | Value                                                                                                                                                  |
+| --------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| CPU mitigations | `mitigations=auto`, permanently. The box is internet-exposed with published ports, so this is a security decision rather than a missing optimisation |
+| Split-lock      | Left at kernel default.`split_lock_mitigate=0` would let one misbehaving container stall the memory bus for every other one                          |
+| NMI watchdog    | `nmi_watchdog=0`; `kernel.watchdog` soft/hard lockup detection is retained, since the box is administered remotely                                 |
+| Isolation knobs | `nohz_full` / `rcu_nocbs` compiled in and deliberately unused ([rejected](docs/TUNING-FINDINGS.md#tested-and-rejected))                             |
 
 ## SCX Scheduler Notes (Panther Lake)
 
@@ -117,22 +189,24 @@ Both workflows run a pre-flight check that compares upstream `pkgver` against re
 ### Caching
 
 **GHA workflow** (`build-cachyos-server.yml`):
+
 - **Docker Buildx**: builder image layers cached in GHA cache (`type=gha`); warm builds skip the ~5-minute package install
 - **ccache**: 8 GB, persisted via `actions/cache`, keyed on kernel version (`ccache-Linux-x86_64v3-{kver}`); incremental rebuilds skip unchanged translation units
 
 **Oracle A1 workflow** (`build-cachyos-server-oracle.yml`):
+
 - **Docker**: plain `docker build --pull`; the persistent self-hosted runner keeps Docker's own layer cache between runs, no GHA cache used
 - **ccache**: 8 GB, persisted via `actions/cache`, keyed separately (`ccache-Linux-aarch64-cross-x86_64v3-{kver}`); separate from the GHA cache bucket
 
 ### Build environment
 
-| | GHA `ubuntu-latest` | Oracle A1 self-hosted |
-|---|---|---|
-| Architecture | x86-64 (native) | ARM64 -> x86-64 (cross) |
-| Disk free | `slimhub_actions` (~40-60 GB freed) | Persistent runner, manual cleanup |
-| Swap | 32 GB on `/mnt` | 16 GB on `/mnt` |
-| Docker cache | Buildx GHA cache | Local layer cache (persistent) |
-| Timeout | 360 min | 480 min |
+|              | GHA`ubuntu-latest`                  | Oracle A1 self-hosted             |
+| ------------ | ------------------------------------- | --------------------------------- |
+| Architecture | x86-64 (native)                       | ARM64 -> x86-64 (cross)           |
+| Disk free    | `slimhub_actions` (~40-60 GB freed) | Persistent runner, manual cleanup |
+| Swap         | 32 GB on`/mnt`                      | 16 GB on`/mnt`                  |
+| Docker cache | Buildx GHA cache                      | Local layer cache (persistent)    |
+| Timeout      | 360 min                               | 480 min                           |
 
 The BTF+ThinLTO peak can spike past available RAM during linking; swap prevents OOM-kill. Oracle A1 uses 16 GB because cross-compile peak is lower than native ThinLTO on x86.
 
@@ -151,9 +225,13 @@ After building, each workflow checks the kernel. On failure the build stops and 
 - `SHA256SUMS`: SHA-256 checksums for all packages
 - `BUILD_MANIFEST`: compiler version, CachyOS commit, build timestamp, full config metadata
 
-Release tag format: `v{KERNEL}-cachyos-servermax-x86_64v3-{YYYYMMDD}.{RUN}`
+Release tag format: `v{KERNEL}-cachyos-servermax-nuc16pro-x86_64v3-{YYYYMMDD}.{RUN}`
 
-Example: `v7.1.rc2-cachyos-servermax-x86_64v3-20260610.3`
+Example: `v7.2.4-cachyos-servermax-nuc16pro-x86_64v3-20260909.140`
+
+Tags published before 2026-09-13 omit the `nuc16pro-` segment. Everything that reads
+these tags (the build preflight, the drift check, the on-box updater) accepts both forms,
+so older releases stay discoverable.
 
 RC kernels are published as pre-releases.
 
@@ -387,285 +465,23 @@ These appear in the log on this board and are harmless to operation. They are AS
 
 The updater does not suppress these; their cause is understood (firmware) and silencing them would hide real future messages.
 
-### 10. ServerMax tuning round 2 (2026-08-23): memory, dm-crypt, boot order
+### 10. Tuning findings, measurements, and rejected candidates
 
-Everything in this section was measured on the live box before it was committed. Where a
-candidate did not survive measurement it is listed under "tested and rejected" rather than
-quietly dropped, because the rejections are the more useful half of the record.
+The detailed measurement log lives in **[`docs/TUNING-FINDINGS.md`](docs/TUNING-FINDINGS.md)**,
+so this file stays a reference for the box rather than a lab notebook. It covers:
 
-#### Multi-size THP (mTHP), the biggest single win
+| section                                                          | subject                                                                                                                                         |
+| ---------------------------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------- |
+| [10](docs/TUNING-FINDINGS.md#10-tuning-round-2-2026-08-23)        | Tuning round 2: mTHP, dm-crypt bypass, zswap, boot ordering, and everything tested and rejected (KSM, DAMON, blk-wbt, irqbalance,`nohz_full`) |
+| [11](docs/TUNING-FINDINGS.md#11-hardware-ceiling-audit)           | Hardware ceiling audit: per-component register readings, what is already maxed, and the four limits that are physical rather than configurable  |
+| [12](docs/TUNING-FINDINGS.md#12-verification-discipline)          | Verification discipline: why a change needs a number, and how to benchmark this specific box without fooling yourself                           |
+| [13](docs/TUNING-FINDINGS.md#13-routine-checkup-2026-09-01)       | Routine checkup: why Vulkan stays on lavapipe, and why`scxctl get` reporting "its own defaults" is healthy                                    |
+| [14](docs/TUNING-FINDINGS.md#14-drift-check-corrected-2026-09-13) | Drift check corrected: it was comparing against kernel.org instead of the CachyOS PKGBUILD the build actually consumes                          |
 
-The kernel defaults every anonymous THP order except PMD (2MB) to `never`
-([`transhuge.rst`](https://docs.kernel.org/admin-guide/mm/transhuge.html): *"By default,
-PMD-sized hugepages have enabled=inherit and all other hugepage sizes have
-enabled=never"*). On a 30GB box running ~70 containers with a ~17GB page cache, 2MB
-contiguous allocations mostly cannot be served, and there was no smaller huge-page order to
-fall back to. Measured before the change:
-
-```
-thp_fault_alloc     172801
-thp_fault_fallback 1573192      -> 81% of THP faults degraded to 4k pages
-```
-
-`nuc16pro-servermax-mm.service` enables orders 16k/32k/64k. Re-measured ~10 minutes after:
-
-| order | alloc | fallback | success |
-| ----- | ----- | -------- | ------- |
-| 64kB | 363443 | 51554 | **87.6%** |
-| 16kB | 215758 | 85548 | 71.6% |
-| 32kB | 123649 | 70767 | 63.6% |
-| 2048kB (PMD, unchanged) | 36299 | 152647 | 19.2% |
-
-~700k huge-page allocations succeeded that would otherwise have been 4k pages. Orders
-128k-1024k are left off on purpose: each additional order adds internal fragmentation and
-another rung for the allocator to try and fail on, and they rarely match real allocation
-sizes. PMD keeps `inherit` so it still follows the global `enabled=always`.
-
-Verify: `for d in /sys/kernel/mm/transparent_hugepage/hugepages-*kB; do echo "$(basename $d) $(cat $d/enabled)"; done`
-Revert: `systemctl disable --now nuc16pro-servermax-mm.service` and write `never` back.
-
-#### dm-crypt workqueue bypass
-
-The root LV and both media disks are LUKS, so every container read and write pays the
-dm-crypt path. dm-crypt defaults to handing crypto to an unbound workqueue and offloading
-writes again to a second thread; with hardware AES (this box exposes `vaes`, cipher is
-`aes-xts-plain64`, `xts(aes)` resolves to a VAES/AVX2 driver) the encryption is cheaper than
-that scheduling round-trip. `no-read-workqueue` / `no-write-workqueue`
-([`crypttab(5)`](https://man7.org/linux/man-pages/man5/crypttab.5.html), kernel 5.9+) make
-dm-crypt process requests synchronously instead.
-
-The updater rewrites whatever `crypttab` entries the box has (auto-detected, no UUIDs in this
-repo), applies them live with `cryptsetup refresh` wherever a keyfile exists, and regenerates
-the initramfs for the root entry. Devices unlocked by TPM or passphrase pick the flags up on
-the next boot.
-
-Verify: `sudo dmsetup table --target crypt` should show `no_read_workqueue no_write_workqueue`.
-
-#### Block layer: tried wbt off + rq_affinity=2, measured nothing, reverted
-
-The mechanism argument was sound: ADIOS already does latency-targeted arbitration with its
-own per-op latency models, so blk-wbt is a second and blinder throttle on top of a smarter
-one (upstream reached the same conclusion for BFQ), and `rq_affinity=2` completes on the
-submitting CPU rather than its cache "group", which should matter on a hybrid part where a
-group spans dissimilar cores.
-
-Then it was actually benchmarked, with `fio` on the NVMe behind the LUKS data disk, five
-interleaved A/B pairs so drift could not favour one side:
-
-| config | READ KB/s mean / median | WRITE KB/s mean / median |
-| ------ | ----------------------- | ------------------------ |
-| wbt=0, rq_affinity=2 | 161358 / 163783 | 133294 / 135919 |
-| kernel defaults | **164477 / 164417** | 131533 / **136501** |
-
-The spread *within* each config was wider than the difference *between* them, and the kernel
-defaults came out marginally ahead on both medians. So the change bought nothing measurable
-on this workload and the udev rule was withdrawn. The defaults are also the better-tested
-path. `nr_requests=1023` and the ADIOS elevator itself are unaffected and stay.
-
-Worth stating plainly: this is what the rest of section 10 would look like if it had been
-wrong. mTHP has counters behind it, the crypt flags have a dm table behind them, and this
-one had only a story, so it went.
-
-#### Boot ordering: tuning now lands before dockerd
-
-Measured: `multi-user.target` only went active at **42.8s**, while `docker.service` started at
-**19.5s**. Every unit ordered `After=multi-user.target` - which was both tuning oneshots - was
-therefore applying CPU, NVMe, NIC and thermal policy *23 seconds after* ~70 containers had
-already started, under the firmware's cold-boot power policy. All three tuning units are now
-`After=basic.target` + `Before=docker.service`, the same fix already proven for the sched_ext
-attach. The healthcheck asserts the ordering every boot so this cannot regress silently
-again.
-
-#### Smaller items
-
-- **zswap pool 20% -> 30%**: 12.77M writeouts against 7.88M readins is a pool too small to
-  hold the working set, so pages were being pushed out and pulled straight back off the
-  encrypted root. The pool is a ceiling, not a reservation.
-- **DAMON proactive reclaim: tried, measured, removed.** It was enabled with a 128MiB/s
-  quota, a 10ms/s CPU quota and 60s `min_age`, with watermarks deliberately set to
-  high=1000/mid=1000/low=0 because this box runs at ~1.5% free memory with most of RAM as page
-  cache, so the documented example `wmarks_low=200` would have parked it below its own low
-  watermark and it would never have run at all. After ~19 hours:
-  `bytes_reclaimed_regions=0`, `nr_reclaimed_regions=0`, while `nr_quota_exceeds=2` proved the
-  kdamond was alive and actually hitting its quota, and the box was still holding 6.6GB of
-  swap. It ran, it cost CPU, and it reclaimed nothing measurable. The reason is that MGLRU
-  (fully enabled at `0x0007`) plus the zswap shrinker already drain cold anon continuously, so
-  nothing survives to 60s idle. DAMON is aimed at bursty latency-sensitive reclaim; a media
-  server that swaps steadily is not that shape. Asserted `N` so a stale module parameter
-  cannot restart it.
-- **Docker log rotation** (50m x 3, compressed) merged into the existing `daemon.json`. The
-  default json-file driver has no size cap, which on ~70 containers is a real disk-fill risk
-  on the encrypted root. dockerd is deliberately *not* restarted by the updater.
-- **`noatime`** on the two media data disks (box-local `fstab`, not repo-tracked: the mount
-  points and UUIDs are host-specific).
-- **bluetooth stays ENABLED.** It produces the large majority of the journal error lines on
-  this box (9436 of 10182 in one boot) because it keeps finding nearby devices it cannot pair
-  with, and disabling it was briefly attempted for that reason. That was wrong: Home Assistant
-  uses the adapter for its BLE integrations (the container is privileged, `net=host`, with
-  `/run/dbus` bind-mounted, talking to `hci0` via BlueZ). Log noise is cosmetic, a broken smart
-  home is not. The healthcheck reports bluetooth state and flags neither direction, because
-  whether it is on is an operator decision and not a health defect. Note that a
-  plain `systemctl disable` does not survive a reboot here anyway, since systemd presets and
-  the bluez postinst re-enable it.
-
-#### Tested and rejected
-
-| candidate | verdict |
-| --------- | ------- |
-| **KSM** (kernel samepage merging) | **Rejected on measurement.** Enabled with `advisor_mode=scan-time`; after 436 full scans and 1.6M pages scanned it had merged **15 pages** with `general_profit = -1884032`, i.e. a net *loss* of ~1.8MB. KSM only examines memory a process opted in via `MADV_MERGEABLE`/`PR_SET_MEMORY_MERGE`, and Docker sets neither; container image layers are already shared through the overlayfs page cache. Asserted off so a default flip cannot re-enable it. |
-| **irqbalance** | Not installed. It has no awareness of P/E/LP-E asymmetry, so on this part it can migrate a NIC queue's IRQ onto a low-power core. The kernel's default spread plus `threadirqs` is left in place. |
-| **`nohz_full` / `rcu_nocbs`** | Available in the config (`CONFIG_NO_HZ_FULL=y`, `CONFIG_RCU_NOCB_CPU=y`) and deliberately unused. Both are for pinned, isolated, single-tenant-per-core workloads; on a box with ~70 containers freely scheduled across all 16 cores they cost housekeeping-CPU capacity and gain nothing. |
-| **`mitigations=off`** and per-mitigation opt-outs | Permanently off the table. The box is internet-exposed with published ports. |
-| **`split_lock_mitigate=0`**, `kernel.watchdog=0` | Rejected: the first lets a misbehaving container stall the memory bus for everyone, the second removes hang detection from a machine that is administered remotely. |
-| **RAPL / PL1 / PL2 writes, C-state forcing, `performance` governor pinning** | Unchanged, for the reasons in §6: the 356H is silicon-capped at 80W MTP and light cores releasing power budget is what lets loaded cores turbo. |
-| **scx_flash explicit `server_mode` flags** | Left alone. `config.toml` sets `default_mode = "Server"`, but per the scx_loader schema a mode only means something if a `[scheds.'flash'] server_mode = [...]` array defines flags, so flash currently runs with its own upstream defaults - confirmed by `ps` showing zero arguments. That is a healthy, supported state (attached, `NRestarts=0`), so the mode line is cosmetic rather than broken and the scheduler was not touched. |
-| **Jumbo frames, `busy_poll`, coalescing changes** | Not pursued: WAN-capped upload workload on a 1500-MTU LAN with mixed clients, and `rx-usecs=3` is already the aggressive end. |
-
-#### Currency
-
-Checked against upstream at the time of writing: kernel.org latest stable **7.2** / box running
-**7.2.0**-cachyos-edge, and `sched-ext/scx` latest release **v1.1.3** / box running
-**scx_flash 1.1.3**. Both arrived on the box unattended through the existing pipeline, which is
-the pipeline working as designed. Nothing is pinned; the drift badge at the top of this file is
-the standing check.
-
-### 11. Hardware ceiling audit: what is actually maxed, and what cannot be
-
-Read from hardware registers rather than inferred, so this is a factual ledger rather than an
-aspiration. It exists so that a future "max everything out" pass starts from what is already at
-its limit instead of re-litigating it.
-
-| component | measured state | verdict |
-| --------- | -------------- | ------- |
-| CPU | `cpuinfo_max_freq` 4.7GHz == `scaling_max_freq`, `no_turbo=0`, `max_perf_pct=100`, no core capped | **at ceiling** |
-| Instruction set | `avx2` + `avx_vnni`, **no AVX-512 of any kind** | **x86-64-v3 is a hard ceiling**; v4 is impossible on this silicon, never propose it |
-| PCIe | every device negotiates at its full `LnkCap`: Crucial P310 16GT/s x4 (Gen4), Micron 2200 8GT/s x4 (Gen3, the drive's own limit), both I226-V 5GT/s x1 | **at ceiling**, nothing under-negotiating |
-| iGPU (Xe3) | `max_freq` == `rp0_freq` == 2450MHz | **unrestricted** |
-| Memory | 2x16GB DDR5-4800 running at 4800 MT/s on **both** controllers | at these modules' rated max |
-| Ethernet | both ports 2500Mb/s full duplex | I226-V silicon max |
-| USB | root hubs at 20000M/x2 | USB 3.2 Gen2x2 max |
-| Thunderbolt | `domain0` present, nothing attached | n/a |
-| Display | all four DP/HDMI connectors disconnected | headless, nothing to tune |
-| WiFi (BE211) | associated 5GHz ch161 at **80MHz HE (WiFi 6)**, MCS11 NSS2, 1200Mbit tx | **not** at ceiling, but the limit is the AP (WiFi 6, no 6GHz/320MHz) and `wlo1` is failover-only behind bond0 |
-
-Idle cores sitting at 400MHz is the intended power-budget sharing on an 80W-capped part, not a
-fault. One PCIe root port reporting width `x0` is an empty slot, not a defect.
-
-**What is left is physical, not configuration:**
-
-1. **Memory is the real bottleneck.** 30% of zswap writeouts get read back and the box holds
-   several GB of swap. No kernel setting fixes a capacity shortage; larger/faster SODIMMs would
-   outweigh every software change in sections 10 and 11 combined.
-2. **WiFi** needs a WiFi 7 AP to reach 320MHz. It is a failover path, so this is low value.
-3. **The Micron 2200 is a Gen3 drive.** x4 Gen3 is its ceiling; only a newer drive changes it.
-4. **Sustained CPU power** is bounded by the 80W MTP silicon cap and the cooler, both BIOS-owned
-   (§6).
-5. **`mitigations=auto`** stays. Internet-exposed box; this is a security decision, not a
-   missing optimisation.
-
-### 12. Verification discipline (why some of section 10 was withdrawn)
-
-Round two originally shipped four changes on mechanism alone. They were then measured, and two
-did not survive. The rule this establishes for this repo:
-
-**A tuning change stays only if it has a number behind it.** mTHP has per-order allocation
-counters. The dm-crypt flags have a `dmsetup table` line. KSM had `general_profit`, DAMON had
-`bytes_reclaimed_regions`, and the block-layer knobs had an fio A/B; all three of those numbers
-came back negative, zero, or noise, so all three are gone.
-
-Practical notes for benchmarking this specific box:
-
-- There was **no benchmark capability at all** until `fio` was installed. Mechanism-only
-  reasoning is what let two unverifiable changes ship, so measure before claiming.
-- The box idles around load 5 with ~70 containers. **fio deltas under roughly 5% are noise
-  here.** Interleave A/B/A/B so drift cannot favour one side, run at least five pairs, and
-  compare medians as well as means. A single before/after pair is worthless.
-- Hardware ceilings (section 11) come from registers and are deterministic; those do not need
-  repeated sampling, unlike throughput.
-
-### 13. Routine checkup 2026-09-01: Vulkan status and the scx "mode" question
-
-Two specific doubts were raised and both were chased to a definite answer.
-
-#### "Vulkan is not hardware" — correct, and it must stay that way for now
-
-The box forces software Vulkan (lavapipe) via `/etc/environment` and a
-`gnome-remote-desktop.service` drop-in, so anything that opens a Vulkan device gets llvmpipe:
-
-```
-driverName = llvmpipe   deviceName = llvmpipe (LLVM 21.1.8, 256 bits)
-```
-
-Forcing the hardware ICD (`/usr/share/vulkan/icd.d/intel_icd.json`) does now enumerate the real
-GPU cleanly, which is a genuine change since the workaround was written:
-
-```
-deviceName = Intel(R) Graphics (PTL)   deviceType = INTEGRATED_GPU
-driverName = Intel open-source Mesa driver   Mesa 26.0.8   ERRORS: 0
-```
-
-**That is not sufficient evidence to remove the workaround, and it was nearly mistaken for it.**
-`vulkaninfo` only enumerates: it creates an instance and queries properties. The July SIGSEGV was
-in `GrdHwAccelVulkan`, on the PipeWire **dmabuf import plus compute color-convert** path, which
-`vulkaninfo` never touches. Enumeration working proves nothing about the path that crashed.
-
-The decisive fact is the Mesa version. The relevant upstream fix, *"ANV: dEQP ASTC tests crash w/
-FPE_INTDIV on Xe3"*, shipped in **Mesa 26.1.2**. This box runs **26.0.8**, and 26.0.8 is the newest
-build Ubuntu resolute offers (`apt-cache policy` shows candidate == installed). So the box does not
-have the Xe3 ANV fixes, and the crash conditions are still present.
-
-Corroborating, and easy to misread: there have been **zero** GRD crashes and zero ANV segfaults this
-boot. That is the workaround doing its job, not evidence the bug is gone. The Intel ICD is never
-loaded, so it cannot crash.
-
-**Verdict: keep the lavapipe pin.** Revisit when Mesa >= 26.1.2 reaches this release. The cost is
-narrow: the RDP colour-convert runs on CPU, H.264 encode stays hardware VAAPI, and VA-API is a
-completely separate stack that is unaffected (45 profiles, iHD 26.3.2 live). Plex, HA, metube and
-convertx transcode through `/dev/dri` on VA-API and never touch Vulkan.
-
-#### `scxctl get` says "with its own defaults" — expected, not a regression
-
-The recollection that it used to say Server mode is half right. The loader *is* applying Server
-mode; the string just reports the argument state. The evidence:
-
-```
-scx_loader[..]: switching Flash with mode Server..
-scx_loader[..]: WARN: switching Flash to Server mode, but no mode-specific
-                arguments are configured; the scheduler will run with its own defaults
-SchedulerMode (DBus property) = 4        # 4 = Server
-/proc/<pid>/cmdline            = "scx_flash"   # no args
-```
-
-So mode selection is working and `config.toml`'s `default_mode = "Server"` is honoured. What is
-absent is a `[scheds.'flash'] server_mode = [...]` array defining *which flags* Server mode should
-pass, so the loader falls through to flash's upstream defaults and says so. Flash is attached with
-`NRestarts=0`; this is a healthy state, and the wording changed because newer scx-loader added that
-explicit warning.
-
-Deliberately not "fixed" by inventing flags. Flash's defaults (`--slice-us 700`,
-`--slice-us-lag 20000`) are upstream's tuned values, and picking different numbers without an A/B
-on this workload would be exactly the mechanism-only change that section 12 exists to prevent.
-
-#### Version mismatch explained
-
-`scxctl`/`scx_loader` report **1.1.2** while `scx_flash` reports **1.1.3**. Not a packaging fault:
-`sched-ext/scx` latest release is v1.1.3, but `sched-ext/scx-loader` is a **separate repository**
-whose newest tag is **v1.1.2**. The build script tries the matching tag and falls back to the
-default branch, so 1.1.2 is the newest loader that exists. Both are current.
-
-#### Everything else
-
-Kernel auto-tracked to **7.2.2**, which kernel.org confirms is the latest stable (7.3 is still
-`-rc1`), and scx is at the latest v1.1.3 — the no-pinning pipeline working unattended again.
-Healthcheck `warnings=0`, 0 failed units, 80 containers 0 unhealthy, 0 throttle events at 73C,
-bond 2/2, dm-crypt 3/3, all four tuning units confirmed applying **before** docker.
-
-mTHP at scale, the headline win, keeps holding: **74.3M** huge-page allocations at 98-99% success
-(16k 22.5M, 32k 13.4M, 64k 38.4M) against PMD's 10%.
-
-One number worth watching: the zswap refault ratio has risen from 30% to **56%**, and swap sits at
-10GB. That is the RAM-capacity ceiling from section 11 asserting itself as the container count grew
-to 80, not a tuning regression. No software setting fixes it.
+The short version of the rule those sections establish: **a tuning change stays only if it has
+a number behind it.** Four changes once shipped on mechanism alone; two of them were then
+measured and removed. Rejected candidates are documented rather than dropped, so a future pass
+does not re-propose something already disproven on this hardware.
 
 ## Manual Build
 
