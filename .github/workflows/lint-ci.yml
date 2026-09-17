@@ -203,7 +203,12 @@ jobs:
             {
               echo "## shellcheck: clean"
               echo
-              printf 'All %d script(s) under `scripts/` parse and carry no error-severity findings.\n' "${#files[@]}"
+              # Double quotes with escaped backticks, not a single-quoted printf format,
+              # because a backtick inside single quotes reads as an unexpanded command
+              # substitution (SC2016) and this job lints itself.
+              # (A comment line may not begin with the linter's own name either: that is
+              # parsed as an inline directive, not prose.)
+              echo "All ${#files[@]} script(s) under \`scripts/\` parse and carry no error-severity findings."
               echo
               echo "Warning-severity findings are not gated here - see the comment in this job"
               echo "for why."
