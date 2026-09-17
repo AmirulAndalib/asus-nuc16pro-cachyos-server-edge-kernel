@@ -521,6 +521,7 @@ so this file stays a reference for the box rather than a lab notebook. It covers
 | [12](docs/TUNING-FINDINGS.md#12-verification-discipline)          | Verification discipline: why a change needs a number, and how to benchmark this specific box without fooling yourself                           |
 | [13](docs/TUNING-FINDINGS.md#13-routine-checkup-2026-09-01)       | Routine checkup: why Vulkan stays on lavapipe, and why`scxctl get` reporting "its own defaults" is healthy                                    |
 | [14](docs/TUNING-FINDINGS.md#14-drift-check-corrected-2026-09-13) | Drift check corrected: it was comparing against kernel.org instead of the CachyOS PKGBUILD the build actually consumes                          |
+| [15](docs/TUNING-FINDINGS.md#15-drift-check-now-clears-the-drift-and-the-ci-got-its-own-ci-2026-09-17) | Drift check now dispatches the build that clears the drift, guarded against recursion; workflows hardened and given their own lint/security CI |
 
 The short version of the rule those sections establish: **a tuning change stays only if it has
 a number behind it.** Four changes once shipped on mechanism alone; two of them were then

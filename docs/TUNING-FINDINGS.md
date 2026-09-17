@@ -348,3 +348,138 @@ both build workflows pass to the build script. Verified at the time of the fix: 
 `build-cachyos-server.yml` and `build-cachyos-server-oracle.yml` pass
 `CACHY_VARIANT="linux-cachyos-server"`, and CachyOS's `linux-cachyos-rc` variant sits at 7.3.0,
 which confirms 7.2.4 on the server variant is deliberate rather than a stalled repo.
+
+## 15. Drift check now clears the drift, and the CI got its own CI (2026-09-17)
+
+Finding 14 made the drift check correct. It was still only a smoke alarm: it compared, it went
+red, and then it waited for the relevant build workflow's next daily cron. Between an upstream
+release and that cron the box was knowingly behind for up to 24 hours, with a red badge nobody
+could act on. Three consecutive scheduled runs failed on exactly that, all reporting the same
+real gap (CachyOS 7.2.6, newest release here 7.2.5) and none of them doing anything about it.
+
+The check now dispatches the build that closes the gap: kernel drift starts
+`build-cachyos-server.yml`, scx drift starts `build-scx-schedulers.yml`. Neither is forced,
+because each build's own pre-flight skips a version that already has a release, and that
+idempotency is exactly what makes a redundant dispatch harmless.
+
+### Three constraints shaped the design
+
+**Recursion is a real failure mode, not a theoretical one.** `workflow_dispatch` is one of the
+two events GitHub explicitly exempts from "events triggered by `GITHUB_TOKEN` do not create a
+new workflow run". So a dispatch from this check really does start a build, and that build's
+completion really does re-trigger the check through `workflow_run`. On the happy path that
+terminates, because the build publishes a release and the drift clears. On the failure path it
+does not: a build that fails, or one whose pre-flight skips a version that never produced a
+release, leaves the drift in place and gets dispatched again, forever.
+
+The guard is structural rather than clever. The dispatch step is gated off the `workflow_run`
+trigger entirely, which makes the 4-hourly cron the only dispatch clock. A build completion can
+report, but it can never re-arm the build.
+
+**The Oracle A1 cross-build is never dispatched.** It is the fallback for when the
+GitHub-hosted build fails, it runs on a self-hosted machine that may be powered down (a
+dispatch would queue indefinitely rather than fail), and racing the two can publish two
+releases for one kernel version. Its own 21:00 UTC cron already covers the case it exists for.
+
+**A GitHub expression trap almost made the whole thing inert.** The dispatch gate was first
+written as `inputs.auto_build != false`. On a `schedule` event there is no `inputs` context, so
+that operand is null, and GitHub compares mixed types by casting both sides to numbers: null
+becomes 0 and `false` becomes 0. `null != false` is therefore **false**, and the step would
+have been silently skipped on the one trigger allowed to dispatch. No error, no annotation, the
+step simply shows as skipped. It is written as an event guard now:
+
+```yaml
+if: >-
+  github.event_name != 'workflow_run' &&
+  (github.event_name != 'workflow_dispatch' || inputs.auto_build) &&
+  (steps.resolve.outputs.kernel_state == 'DRIFT' || steps.resolve.outputs.scx_state == 'DRIFT')
+```
+
+Neither `actionlint` nor `zizmor` flags the broken form. Both spellings are valid syntax.
+
+### Badge semantics changed
+
+| state | job |
+| ----- | --- |
+| no drift | green |
+| drift, build dispatched by this run | green |
+| drift, build already queued or running | green |
+| drift still present after a build completed | **red** |
+| dispatch itself failed | **red** |
+
+Red now means the pipeline is genuinely broken rather than merely behind. The old red window
+between an upstream release and the next daily build was noise, and noise on a badge trains
+people to ignore it.
+
+### Silent-failure surfaces that got closed
+
+A `workflow_run` trigger naming a workflow it cannot resolve **fails open**: GitHub neither
+errors nor fires it. A rename of any build workflow therefore used to degrade this check to
+cron-only with no signal anywhere. A step now reads each build workflow's own `name:`, asserts
+it appears in the `on.workflow_run.workflows` list, and cross-checks that the dispatch targets
+are registered with GitHub Actions, so that degradation is a red job.
+
+### Nothing was auditing the CI
+
+The workflows build a kernel and publish it to a machine on the open internet, and nothing
+reviewed them. `lint-ci.yml` now runs actionlint (checksum-pinned), zizmor for Actions-specific
+security, shellcheck over `scripts/` at error severity, and a regeneration check on the
+updater. Its first run failed on its own file, catching markdown backticks inside a
+single-quoted `printf` (`SC2016`), and then a comment beginning with the linter's own name,
+which is parsed as an inline directive rather than prose (`SC1073`). Both were reachable only
+through actionlint's shellcheck integration, which spawns a process per `run:` block: fast on
+the Linux runner, unusably slow under Windows, so local checking had skipped it.
+
+zizmor's findings across the existing workflows were real and are fixed: workflow inputs and
+third-party API strings (the sched-ext tag, the `force` input) reached the shell by string
+interpolation into `run:` bodies and now arrive through `env`, quoted on use; every checkout
+sets `persist-credentials: false`; each file starts at `permissions: {}` with jobs widening to
+exactly what they need. The one suppression is the `workflow_run` trigger itself, annotated in
+place with the reason it is safe here: it triggers only on this repo's own workflows, checks
+out the default branch rather than any PR head, and runs nothing from the triggering run.
+
+### Release assets carry provenance
+
+Every published `.deb` and scx binary now gets a signed SLSA build-provenance attestation from
+the workflow's own OIDC identity. `SHA256SUMS` proves a file was not altered in transit; the
+attestation proves which workflow run, from which commit, produced it, which is the stronger
+claim on a box that installs these packages unattended. Verify with:
+
+```bash
+gh attestation verify linux-image-*.deb \
+  --repo AmirulAndalib/asus-nuc16pro-cachyos-server-edge-kernel
+```
+
+The attest step runs **after** the release, not before. Attestation is additive, and a Sigstore
+outage must not discard a kernel that already built for six hours and published successfully.
+
+### Verified in production, not just reasoned about
+
+The dispatch path was exercised end to end on 2026-09-17 rather than left as static analysis:
+
+- a manual run found the real 7.2.6 drift and dispatched `build-cachyos-server.yml`
+  (`event=workflow_dispatch`); the job reported `DRIFT - build dispatched` and went **green**,
+  where the three preceding scheduled runs on the same drift had gone red and done nothing
+- the dispatched build's pre-flight did **not** skip, confirming it resolved a version with no
+  existing release
+- the next 4-hourly cron, firing while that build was still running, hit the in-flight guard:
+  `skipping dispatch of build-cachyos-server.yml, a run is queued or in progress`, reported
+  `DRIFT - build already running`, and stayed green. `gh run list` confirmed exactly one kernel
+  build existed, so the guard prevented a duplicate rather than merely claiming to
+
+Separately, `build-scx-schedulers.yml` ran on its own cron with the modernised file and
+succeeded, which validated the boolean-input-through-`env` pattern on the schedule path where
+`inputs` does not exist: `FORCE_BUILD` arrived empty and correctly did not force.
+
+### Deliberately not done
+
+The two kernel build workflows are roughly 95% identical and an obvious candidate for a
+`workflow_call` reusable workflow. It was left alone. They diverge on runner (hosted versus
+self-hosted label set, which forces `runs-on` through `fromJSON` on an input), timeout, swap
+size, Docker build path (Buildx with GHA cache versus plain `docker build`), ccache key,
+validation strategy (QEMU/KVM boot test versus package content inspection), and the
+cross-compile environment. Collapsing that into one parameterised workflow means roughly eight
+inputs and several conditional steps, which is not obviously simpler than two readable files,
+and it is a refactor with a six-hour feedback loop on a pipeline that currently works. Doing it
+in the same change as the drift plumbing would also have given any breakage two candidate
+causes.
