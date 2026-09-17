@@ -1,0 +1,254 @@
+name: Lint workflows and shell scripts
+
+# The rest of this repo is CI that builds a kernel and publishes it to a machine on the open
+# internet. Nothing was checking the CI itself, so a broken expression, an over-broad
+# permission, or a template injection in a `run:` block could only be found by shipping it.
+# This job is the review those files never got:
+#
+#   actionlint - workflow schema, expression syntax, action inputs, runner labels, and
+#                (through the shellcheck preinstalled on the runner) the shell inside every
+#                `run:` block.
+#   zizmor     - security audit specific to GitHub Actions: template injection, credential
+#                persistence, over-broad permissions, unpinned actions.
+#   shellcheck - the standalone scripts under scripts/, which actionlint never sees.
+#
+# All three are pinned. actionlint is checksum-verified, because a linter that runs on every
+# push is itself a supply-chain surface.
+
+run-name: >-
+  Lint (${{ github.event_name == 'pull_request'
+    && format('PR #{0}', github.event.number)
+    || github.ref_name }})
+
+on:
+  push:
+    paths:
+      - '.github/workflows/**'
+      - '.github/actionlint.yaml'
+      - 'scripts/**'
+  pull_request:
+    paths:
+      - '.github/workflows/**'
+      - '.github/actionlint.yaml'
+      - 'scripts/**'
+  workflow_dispatch: {}
+
+permissions: {}
+
+concurrency:
+  group: lint-ci-${{ github.ref }}
+  cancel-in-progress: true
+
+defaults:
+  run:
+    shell: bash
+
+env:
+  ACTIONLINT_VERSION: '1.7.12'
+  # sha256 of actionlint_<version>_linux_amd64.tar.gz, taken from the release's own
+  # checksums file. Bump both together or the verification step fails loudly, which is the
+  # intent: a version bump should be a deliberate, verified change.
+  ACTIONLINT_SHA256: '8aca8db96f1b94770f1b0d72b6dddcb1ebb8123cb3712530b08cc387b349a3d8'
+  ZIZMOR_VERSION: '1.30.1'
+
+jobs:
+  actionlint:
+    name: actionlint (workflow syntax + embedded shell)
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Install actionlint (pinned, checksum-verified)
+        run: |
+          set -euo pipefail
+
+          tarball="actionlint_${ACTIONLINT_VERSION}_linux_amd64.tar.gz"
+          url="https://github.com/rhysd/actionlint/releases/download/v${ACTIONLINT_VERSION}/${tarball}"
+
+          curl -fsSL --retry 3 --retry-delay 5 -o "$tarball" "$url"
+          echo "${ACTIONLINT_SHA256}  ${tarball}" | sha256sum --check --strict
+          tar -xzf "$tarball" actionlint
+          sudo install -m 0755 actionlint /usr/local/bin/actionlint
+          rm -f "$tarball" actionlint
+
+          actionlint -version
+          # actionlint shells out to shellcheck for `run:` blocks. It is preinstalled on
+          # ubuntu-latest; if that ever stops being true, say so rather than silently
+          # linting half of what this job claims to lint.
+          if command -v shellcheck >/dev/null; then
+            shellcheck --version | sed -n '2p'
+          else
+            echo "::warning title=shellcheck missing::actionlint will skip the shell inside run: blocks"
+          fi
+
+      - name: Run actionlint
+        run: |
+          set -uo pipefail
+
+          # -oneline keeps each finding to a single grep-able line; the default multi-line
+          # format is unreadable once there is more than a handful.
+          if actionlint -no-color -oneline > actionlint.out 2>&1; then
+            echo "no findings"
+            {
+              echo "## actionlint: clean"
+              echo
+              echo "Every workflow under \`.github/workflows/\` passed schema, expression and"
+              echo "embedded-shell checks."
+            } >> "$GITHUB_STEP_SUMMARY"
+            exit 0
+          fi
+
+          {
+            echo "## actionlint findings"
+            echo
+            echo '```'
+            cat actionlint.out
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+          cat actionlint.out
+          echo "::error title=actionlint failed::see the job summary for each finding. A custom self-hosted runner label belongs in .github/actionlint.yaml, not in an ignore flag."
+          exit 1
+
+  zizmor:
+    name: zizmor (Actions security audit)
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Install zizmor (pinned)
+        run: |
+          set -euo pipefail
+          python3 -m pip install --quiet --disable-pip-version-check "zizmor==${ZIZMOR_VERSION}"
+          zizmor --version
+
+      - name: Run zizmor
+        env:
+          # Lets zizmor resolve action references online (unpinned-action and
+          # stale-action-refs checks) instead of running in reduced offline mode.
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -uo pipefail
+
+          # --persona=regular is the default posture: high-signal findings only, without the
+          # pedantic tier that flags stylistic choices this repo makes deliberately.
+          if zizmor --no-progress --persona=regular --format plain .github/workflows/ > zizmor.out 2>&1; then
+            echo "no findings"
+            {
+              echo "## zizmor: clean"
+              echo
+              echo "No template injection, credential-persistence, permission or"
+              echo "action-pinning findings at the \`regular\` persona."
+            } >> "$GITHUB_STEP_SUMMARY"
+            tail -1 zizmor.out || true
+            exit 0
+          fi
+
+          {
+            echo "## zizmor findings"
+            echo
+            echo '```'
+            cat zizmor.out
+            echo '```'
+            echo
+            echo "A finding that is genuinely intended - the \`workflow_run\` trigger on the"
+            echo "drift check, for instance - is suppressed in place with a"
+            echo "\`# zizmor: ignore[rule-name]\` comment and a reason, never by loosening this job."
+          } >> "$GITHUB_STEP_SUMMARY"
+
+          cat zizmor.out
+          echo "::error title=zizmor found security issues::see the job summary"
+          exit 1
+
+  shellcheck:
+    name: shellcheck (scripts/)
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Run shellcheck
+        run: |
+          set -uo pipefail
+
+          shellcheck --version | sed -n '2p'
+
+          # --severity=error only. These scripts carry a long tail of deliberate style
+          # choices (`ls | grep` over paths this repo controls, positional `read` variables
+          # that are intentionally unused) that are warnings, not defects. Gating on error
+          # keeps this job meaningful: anything it reports is a real parse or correctness
+          # problem, so nobody learns to ignore it.
+          mapfile -t files < <(find scripts -type f \( -name '*.sh' -o -name '*.sh.in' \) | sort)
+          printf 'checking %d script(s)\n' "${#files[@]}"
+
+          if shellcheck --severity=error --shell=bash --format=gcc "${files[@]}" > shellcheck.out 2>&1; then
+            echo "no errors"
+            {
+              echo "## shellcheck: clean"
+              echo
+              printf 'All %d script(s) under `scripts/` parse and carry no error-severity findings.\n' "${#files[@]}"
+              echo
+              echo "Warning-severity findings are not gated here - see the comment in this job"
+              echo "for why."
+            } >> "$GITHUB_STEP_SUMMARY"
+            exit 0
+          fi
+
+          {
+            echo "## shellcheck errors"
+            echo
+            echo '```'
+            cat shellcheck.out
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+          cat shellcheck.out
+          echo "::error title=shellcheck failed::error-severity findings in scripts/ - see the job summary"
+          exit 1
+
+  updater-generated-file:
+    name: Generated updater matches its sources
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Regenerate and diff
+        # check-kernel-updater-sync.yml runs the same assertion, but only when one of the
+        # generator's inputs changed. This copy runs on every scripts/ change, so an edit
+        # made directly to the generated file - the actual failure mode - cannot slip
+        # through by touching no tracked source.
+        run: |
+          set -uo pipefail
+
+          bash scripts/assemble-kernel-updater.sh
+
+          if git diff --exit-code -- scripts/nuc16pro-kernel-updater.sh; then
+            echo "in sync"
+            exit 0
+          fi
+
+          echo "::error file=scripts/nuc16pro-kernel-updater.sh,title=Generated file out of sync::edit scripts/nuc16pro-kernel-updater.sh.in (or the tracked modprobe.d/, sysctl.d/, udev/, systemd/ sources), run scripts/assemble-kernel-updater.sh, and commit the result"
+          exit 1

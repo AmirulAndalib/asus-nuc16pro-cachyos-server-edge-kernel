@@ -11,13 +11,28 @@
 [![kernel.org stable](https://img.shields.io/badge/dynamic/regex?url=https%3A%2F%2Fwww.kernel.org%2Ffinger_banner&search=latest%20stable%20version%20of%20the%20Linux%20kernel%20is%3A%5Cs*%28%5B0-9.%5D%2B%29&replace=%241&label=kernel.org%20stable&color=lightgrey)](https://www.kernel.org/)
 [![release date](https://img.shields.io/github/release-date/AmirulAndalib/asus-nuc16pro-cachyos-server-edge-kernel?label=built&color=informational)](https://github.com/AmirulAndalib/asus-nuc16pro-cachyos-server-edge-kernel/releases)
 
-The **version drift** badge is the one that matters for a no-pinning pipeline. It goes red when
-the newest kernel release here stops matching the CachyOS `linux-cachyos-server` PKGBUILD, which
-is the version this pipeline actually builds from, or when the newest scx release here stops
-matching `sched-ext/scx`'s latest tag. kernel.org stable is reported alongside it as context so
-CachyOS falling behind mainline stays visible, but it is not a failure condition: nothing here
-can make CachyOS rebase. Green means nothing has gone stale behind your back. The check runs
-every 4 hours and again the moment any build workflow completes. See
+The **version drift** badge is the one that matters for a no-pinning pipeline. Drift means the
+newest kernel release here has stopped matching the CachyOS `linux-cachyos-server` PKGBUILD,
+which is the version this pipeline actually builds from, or the newest scx release here has
+stopped matching `sched-ext/scx`'s latest tag. kernel.org stable is reported alongside as
+context so CachyOS falling behind mainline stays visible, but it is not a failure condition:
+nothing here can make CachyOS rebase.
+
+The check does not just report drift, it clears it. On finding drift it dispatches the matching
+build workflow immediately, rather than leaving the box behind until that workflow's next daily
+cron. So the badge reads:
+
+- **green** - either nothing is stale, or drift was found and the build that fixes it is
+  already running.
+- **red** - drift is still there after a build completed. That is the genuinely broken case:
+  the build failed, or it skipped a version that never produced a release.
+
+The check runs every 4 hours and again the moment any build workflow completes. Only the
+4-hourly cron is allowed to dispatch; a build completion can report but never re-arm the build,
+because `workflow_dispatch` is exempt from GitHub's "GITHUB_TOKEN does not trigger new runs"
+rule and a failing build would otherwise re-dispatch itself forever. Kernel drift dispatches the
+GitHub-hosted build only - never the Oracle A1 fallback, whose self-hosted runner may be powered
+down and whose own cron already covers that case. See
 [`version-drift-check.yml`](.github/workflows/version-drift-check.yml) and
 [the correction that produced this behaviour](docs/TUNING-FINDINGS.md#14-drift-check-corrected-2026-09-13).
 
@@ -234,6 +249,35 @@ these tags (the build preflight, the drift check, the on-box updater) accepts bo
 so older releases stay discoverable.
 
 RC kernels are published as pre-releases.
+
+### Build provenance
+
+Every published `.deb`, and every scx binary, carries a signed SLSA build-provenance
+attestation generated from the workflow's own OIDC identity. `SHA256SUMS` proves a file was not
+altered in transit; the attestation proves *which workflow run, from which commit, on which
+runner* produced it. That matters on a box that installs these packages unattended from the
+internet.
+
+```bash
+# Verify a downloaded package before installing it
+gh attestation verify linux-image-*.deb \
+  --repo AmirulAndalib/asus-nuc16pro-cachyos-server-edge-kernel
+```
+
+### Workflows
+
+| workflow | trigger | what it does |
+|---|---|---|
+| `build-cachyos-server.yml` | 09:00 UTC daily, drift dispatch, manual | primary kernel build on a GitHub-hosted runner, QEMU/KVM boot test, release |
+| `build-cachyos-server-oracle.yml` | 21:00 UTC daily, manual | fallback cross-build on the self-hosted Oracle A1; skips when the primary already released |
+| `build-scx-schedulers.yml` | 03:00 UTC daily, drift dispatch, manual | builds sched-ext/scx schedulers plus `scx_loader`/`scxctl` |
+| `version-drift-check.yml` | every 4 h, after any build, manual | compares released versions to upstream and dispatches the build that clears any drift |
+| `check-kernel-updater-sync.yml` | push/PR touching the updater's sources | regenerates the updater and fails if the committed copy differs |
+| `lint-ci.yml` | push/PR touching `.github/` or `scripts/` | actionlint, zizmor (Actions security audit), shellcheck, generated-file check |
+
+Every third-party action is pinned to a commit SHA, Dependabot bumps them weekly in one grouped
+PR, and `lint-ci.yml` audits the workflows themselves so a broken expression or an over-broad
+permission is caught before it ships rather than after.
 
 ## Quick Install (NUC 16 Pro machine)
 

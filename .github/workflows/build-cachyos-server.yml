@@ -1,19 +1,27 @@
 name: Build ASUS NUC 16 Pro CachyOS ServerMax Kernel
 
+# NOTE: the `name:` above is load-bearing. version-drift-check.yml lists it verbatim under
+# on.workflow_run.workflows, and a workflow_run trigger that names a workflow it cannot
+# resolve fails silently. That check asserts the two stay in sync, so rename both together.
+
+run-name: >-
+  Kernel build (${{ github.event_name == 'workflow_dispatch'
+    && (inputs.force && 'manual, forced' || 'manual')
+    || 'scheduled' }})
+
 on:
   workflow_dispatch:
     inputs:
       force:
         description: 'Force build even if version already released (use after repo transitions)'
         required: false
-        default: 'false'
-        type: choice
-        options: ['false', 'true']
+        default: false
+        type: boolean
   schedule:
     - cron: "0 9 * * *"
 
-permissions:
-  contents: write
+# Least privilege at the top; the build job widens to exactly what publishing needs.
+permissions: {}
 
 env:
   FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
@@ -22,15 +30,33 @@ concurrency:
   group: asus-nuc16pro-cachyos-servermax-kernel
   cancel-in-progress: false
 
+defaults:
+  run:
+    shell: bash
+
 jobs:
   build:
     name: Build CachyOS ServerMax kernel for NUC 16 Pro, native x86-64-v3 amd64
     runs-on: ubuntu-latest
     timeout-minutes: 360
+    permissions:
+      contents: write        # publish the GitHub Release
+      id-token: write        # OIDC token for build provenance signing
+      attestations: write    # write the provenance attestation for the .deb assets
+    outputs:
+      kernel_version: ${{ steps.preflight.outputs.kver }}
+      cachy_commit: ${{ steps.preflight.outputs.cachy_commit }}
+      skipped: ${{ steps.preflight.outputs.skip }}
+      release_tag: ${{ steps.release.outputs.tag }}
 
     steps:
       - name: Checkout
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          # Nothing here pushes to git; the release is published with GH_TOKEN via gh.
+          # Leaving the token in .git/config would put it inside any artifact that ever
+          # captured the workspace.
+          persist-credentials: false
 
       - name: Show runner info
         run: |
@@ -54,6 +80,10 @@ jobs:
         id: preflight
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REPO: ${{ github.repository }}
+          # Through env, never interpolated into the script body: a workflow input is
+          # caller-controlled text and must not be able to become shell.
+          FORCE_BUILD: ${{ inputs.force }}
         run: |
           set -euo pipefail
 
@@ -90,12 +120,11 @@ jobs:
 
           # Check 50 most recent releases (includes prereleases) for servermax tag
           RECENT="$(gh release list \
-            --repo "${{ github.repository }}" \
+            --repo "$REPO" \
             --limit 50 \
             --json tagName \
             --jq '.[].tagName' 2>/dev/null || true)"
 
-          FORCE_BUILD="${{ github.event.inputs.force }}"
           if [ "$FORCE_BUILD" = "true" ]; then
             echo "FORCE: skipping version check, building regardless"
             echo "skip=false" >> "$GITHUB_OUTPUT"
@@ -341,8 +370,16 @@ jobs:
           name: cachyos-servermax-debs-run${{ github.run_number }}-${{ github.run_attempt }}
           path: dist/
           retention-days: 7
+          # This step runs on failure too, to capture partial output for diagnosis. When the
+          # build died before writing anything, an empty dist/ is expected, not an error.
+          if-no-files-found: warn
+          # .deb payloads are already xz/zstd compressed; re-zipping them burns CPU for
+          # roughly nothing.
+          compression-level: 0
+          overwrite: true
 
       - name: Create GitHub Release
+        id: release
         if: steps.preflight.outputs.skip != 'true'
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -415,6 +452,10 @@ jobs:
             "${PRERELEASE_OPTS[@]}" \
             --notes-file /tmp/release-notes.md
 
+          # Exposed as a job output so anything downstream (and the run log) can name the
+          # exact release this run produced without re-deriving the tag format.
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+
           RELEASE_URL="${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/releases/tag/${TAG}"
           {
             echo "## Release created"
@@ -429,3 +470,16 @@ jobs:
             echo "| LLD | \`$LLD_VERSION\` |"
             echo "| linux-cachyos | \`$CACHY_COMMIT\` |"
           } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Attest build provenance
+        # Runs AFTER the release on purpose: attestation is additive, and a Sigstore
+        # outage here must not discard a kernel that already built and published.
+        # Signed, verifiable provenance for every published asset: what built it, from which
+        # commit, in which run. Consumers verify with
+        #   gh attestation verify <file> --repo <owner>/<repo>
+        # which matters here because the updater pulls these .debs onto a machine that is
+        # internet-exposed. Uses the job's OIDC identity - no secret to manage.
+        if: steps.preflight.outputs.skip != 'true'
+        uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8  # v4.2.2
+        with:
+          subject-path: 'dist/*.deb'

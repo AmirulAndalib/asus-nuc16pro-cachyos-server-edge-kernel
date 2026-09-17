@@ -1,20 +1,30 @@
 name: Build scx schedulers + loader (sched-ext/scx)
 
+# NOTE: the `name:` above is load-bearing. version-drift-check.yml lists it verbatim under
+# on.workflow_run.workflows, and a workflow_run trigger that names a workflow it cannot
+# resolve fails silently. That check asserts the two stay in sync, so rename both together.
+# That same check dispatches this workflow the moment sched-ext/scx publishes a release,
+# so the daily cron below is a backstop, not the primary trigger.
+
+run-name: >-
+  scx build (${{ github.event_name == 'workflow_dispatch'
+    && (inputs.force && 'manual, forced' || 'manual')
+    || 'scheduled' }})
+
 on:
   workflow_dispatch:
     inputs:
       force:
         description: 'Force build even if this scx tag already has a release'
         required: false
-        default: 'false'
-        type: choice
-        options: ['false', 'true']
+        default: false
+        type: boolean
   schedule:
     # 3am UTC daily - clear of the kernel workflows' 9am/9pm UTC slots.
     - cron: "0 3 * * *"
 
-permissions:
-  contents: write
+# Least privilege at the top; the build job widens to exactly what publishing needs.
+permissions: {}
 
 env:
   FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
@@ -23,15 +33,32 @@ concurrency:
   group: nuc16pro-scx-schedulers
   cancel-in-progress: false
 
+defaults:
+  run:
+    shell: bash
+
 jobs:
   build:
     name: Build scx schedulers + scx_loader/scxctl for ASUS NUC 16 Pro
     runs-on: ubuntu-latest
     timeout-minutes: 60
+    permissions:
+      contents: write        # publish the GitHub Release
+      id-token: write        # OIDC token for build provenance signing
+      attestations: write    # write the provenance attestation for the built binaries
+    outputs:
+      scx_tag: ${{ steps.preflight.outputs.scx_tag }}
+      skipped: ${{ steps.preflight.outputs.skip }}
+      release_tag: ${{ steps.release.outputs.tag }}
 
     steps:
       - name: Checkout
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          # Nothing here pushes to git; the release is published with GH_TOKEN via gh.
+          # Leaving the token in .git/config would put it inside any artifact that ever
+          # captured the workspace.
+          persist-credentials: false
 
       - name: Show runner info
         run: |
@@ -44,6 +71,10 @@ jobs:
         id: preflight
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REPO: ${{ github.repository }}
+          # Through env, never interpolated into the script body: a workflow input is
+          # caller-controlled text and must not be able to become shell.
+          FORCE_BUILD: ${{ inputs.force }}
         run: |
           set -euo pipefail
 
@@ -56,12 +87,11 @@ jobs:
           echo "scx_tag=$SCX_TAG" >> "$GITHUB_OUTPUT"
 
           RECENT="$(gh release list \
-            --repo "${{ github.repository }}" \
+            --repo "$REPO" \
             --limit 50 \
             --json tagName \
             --jq '.[].tagName' 2>/dev/null || true)"
 
-          FORCE_BUILD="${{ github.event.inputs.force }}"
           if [ "$FORCE_BUILD" = "true" ]; then
             echo "FORCE: skipping version check, building regardless"
             echo "skip=false" >> "$GITHUB_OUTPUT"
@@ -94,6 +124,10 @@ jobs:
 
       - name: Build scx schedulers
         if: steps.preflight.outputs.skip != 'true'
+        env:
+          # Resolved from the sched-ext/scx API response, so it is third-party text.
+          # Passing it through env keeps it data rather than shell.
+          SCX_TAG: ${{ steps.preflight.outputs.scx_tag }}
         run: |
           chmod +x scripts/build-scx-schedulers.sh
           mkdir -p dist
@@ -101,7 +135,7 @@ jobs:
           docker run --rm \
             -v "$PWD:/work" \
             -w /work \
-            -e SCX_TAG="${{ steps.preflight.outputs.scx_tag }}" \
+            -e SCX_TAG="$SCX_TAG" \
             -e HOST_UID="$(id -u)" \
             -e HOST_GID="$(id -g)" \
             scx-builder:latest \
@@ -145,8 +179,13 @@ jobs:
           name: scx-schedulers-run${{ github.run_number }}-${{ github.run_attempt }}
           path: dist/
           retention-days: 7
+          # This step runs on failure too, to capture partial output for diagnosis. When the
+          # build died before writing anything, an empty dist/ is expected, not an error.
+          if-no-files-found: warn
+          overwrite: true
 
       - name: Create GitHub Release
+        id: release
         if: steps.preflight.outputs.skip != 'true'
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -207,6 +246,10 @@ jobs:
             --title "$TITLE" \
             --notes-file /tmp/release-notes.md
 
+          # Exposed as a job output so anything downstream (and the run log) can name the
+          # exact release this run produced without re-deriving the tag format.
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+
           RELEASE_URL="${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/releases/tag/${TAG}"
           {
             echo "## Release created"
@@ -219,3 +262,18 @@ jobs:
             echo "| scx version | \`$SCX_TAG\` |"
             echo "| scx commit | \`$SCX_COMMIT\` |"
           } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Attest build provenance
+        # Runs AFTER the release on purpose: attestation is additive, and a Sigstore
+        # outage here must not discard a kernel that already built and published.
+        # Signed, verifiable provenance for every published binary: what built it, from which
+        # commit, in which run. Consumers verify with
+        #   gh attestation verify <file> --repo <owner>/<repo>
+        # These binaries run as root on the target box via scx_loader, so being able to prove
+        # where they came from is worth the one extra step.
+        if: steps.preflight.outputs.skip != 'true'
+        uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8  # v4.2.2
+        with:
+          subject-path: |
+            dist/scx_*
+            dist/scxctl

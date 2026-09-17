@@ -513,7 +513,7 @@ if [ -f /etc/crypttab ] && command -v cryptsetup >/dev/null 2>&1; then
     case "$CT_NAME" in ''|\#*) continue ;; esac
     [ -n "$CT_OPTS" ] || continue
     case "$CT_OPTS" in *no-read-workqueue*) continue ;; esac
-    sed -i "s|^\([[:space:]]*$CT_NAME[[:space:]].*\)\$|\1,no-read-workqueue,no-write-workqueue|" /etc/crypttab
+    sed -i "s|^\([[:space:]]*${CT_NAME}[[:space:]].*\)\$|\1,no-read-workqueue,no-write-workqueue|" /etc/crypttab
     CRYPTTAB_CHANGED=1
     # Live-apply where we can unlock non-interactively; harmless if it fails.
     if [ -n "$CT_KEY" ] && [ "$CT_KEY" != "none" ] && [ -f "$CT_KEY" ]; then

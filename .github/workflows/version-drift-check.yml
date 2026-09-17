@@ -6,8 +6,10 @@ name: Version drift check (kernel + scx vs upstream latest)
 # creates is silent staleness: if a build workflow stops firing, or an upstream release
 # lands and nothing rebuilds, the box quietly drifts behind and there is no signal anywhere.
 #
-# This job is that signal. It compares what this repo has actually released against what
-# the pipeline's REAL build input currently ships, and goes red when they diverge.
+# This job is that signal AND the remediation. It compares what this repo has actually
+# released against what the pipeline's REAL build input currently ships, and when they
+# diverge it dispatches the matching build workflow immediately instead of leaving the box
+# stale until that workflow's next daily cron.
 #
 # Which upstream counts, and why it matters:
 #   - The kernel here is NOT built from a kernel.org tarball. scripts/build-cachyos-server.sh
@@ -18,15 +20,34 @@ name: Version drift check (kernel + scx vs upstream latest)
 #     It is context, not a failure condition: nothing in this repo can make CachyOS rebase
 #     faster, so failing on it would be an alarm nobody can clear.
 #
-# A red result right after an upstream release is expected and self-healing: it means
-# CachyOS moved and the build workflow has not produced a release yet.
+# Job status semantics. These changed when auto-dispatch landed, so read this before
+# "fixing" a red run:
+#   green - no drift, OR drift with remediation in flight (this run dispatched a build, or
+#           a build for that component was already queued/running).
+#   red   - drift with nothing running and nothing dispatched. That is the genuinely broken
+#           state: a build workflow completed and the repo is still behind.
+# Previously the job went red for the entire window between an upstream release and the
+# next daily build. That window was noise rather than signal, and it is now closed by
+# dispatching the build instead of waiting for it.
 
-on:
+run-name: >-
+  Drift check (${{ github.event_name == 'workflow_run'
+    && format('after {0}', github.event.workflow_run.name)
+    || github.event_name }})
+
+on:  # zizmor: ignore[dangerous-triggers]
+  # zizmor flags workflow_run because it usually means "run privileged code on behalf of an
+  # untrusted PR". That is not what happens here: this workflow only ever triggers on its own
+  # repo's build workflows, checks out the default branch rather than any PR head, and runs
+  # nothing from the triggering run - it reads two public APIs and this repo's release list.
+  # The suppression is scoped to this trigger and stays only as long as that is true.
   schedule:
     # Every 4 hours, offset to land AFTER the build windows rather than before them.
     # Builds: build-cachyos-server 09:00 UTC, build-cachyos-server-oracle 21:00 UTC,
     # build-scx-schedulers 03:00 UTC. A kernel build takes well over an hour, so the
     # 03:00/07:00/11:00/15:00/19:00/23:00 grid puts a check ~2h after each build starts.
+    # This cron is also the only clock allowed to dispatch a build (see the recursion note
+    # on the trigger step), so its period is what bounds worst-case remediation latency.
     - cron: '0 3-23/4 * * *'
   # Real coupling: cron alone cannot guarantee the check runs after a build finishes, it
   # only bounds staleness at 4 hours. workflow_run fires the check the moment a build
@@ -34,36 +55,114 @@ on:
   workflow_run:
     # These MUST match the `name:` of each build workflow exactly. GitHub silently never
     # fires a workflow_run trigger that names a workflow it cannot resolve, so a typo here
-    # degrades the check back to cron-only with no error anywhere.
+    # degrades the check back to cron-only with no error anywhere. The "Verify workflow_run
+    # wiring" step below exists precisely to turn that silent degradation into a red job.
     workflows:
       - Build ASUS NUC 16 Pro CachyOS ServerMax Kernel
       - Build ASUS NUC 16 Pro CachyOS ServerMax Kernel (Oracle A1 ARM64 cross)
       - Build scx schedulers + loader (sched-ext/scx)
     types: [completed]
-  workflow_dispatch: {}
+  workflow_dispatch:
+    inputs:
+      auto_build:
+        description: 'Dispatch the matching build workflow when drift is found'
+        required: false
+        default: true
+        type: boolean
 
-permissions:
-  contents: read
+# Least privilege by default; the one job widens only where it must.
+permissions: {}
 
 concurrency:
   group: version-drift-check
   cancel-in-progress: false
+
+defaults:
+  run:
+    shell: bash
 
 jobs:
   drift:
     name: Compare released kernel + scx against upstream
     runs-on: ubuntu-latest
     timeout-minutes: 10
+    permissions:
+      contents: read
+      # actions: write is what lets this job dispatch a build workflow on drift. It also
+      # covers the run-list and workflow-list reads used to check what is already in flight.
+      actions: write
+    outputs:
+      kernel_state: ${{ steps.resolve.outputs.kernel_state }}
+      scx_state: ${{ steps.resolve.outputs.scx_state }}
+      kernel_action: ${{ steps.trigger.outputs.kernel_action }}
+      scx_action: ${{ steps.trigger.outputs.scx_action }}
     env:
       GH_TOKEN: ${{ github.token }}
       # Must match what both build workflows pass to build-cachyos-server.sh. If the build
       # ever switches variant (linux-cachyos-rc, say), change it here in the same commit or
       # this check silently compares against a variant nobody builds.
       CACHY_VARIANT: linux-cachyos-server
+      # Workflow FILES, used both for the wiring check and for dispatch. Filenames are
+      # stable across display-name changes, unlike the workflow_run list above, which the
+      # GitHub schema requires to use display names.
+      KERNEL_WORKFLOW: build-cachyos-server.yml
+      KERNEL_WORKFLOW_ORACLE: build-cachyos-server-oracle.yml
+      SCX_WORKFLOW: build-scx-schedulers.yml
 
     steps:
       - name: Checkout
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Verify workflow_run wiring resolves to real workflows
+        # The workflow_run trigger fails open: name a workflow that does not exist and
+        # GitHub neither errors nor fires. This step reads each build workflow's own `name:`
+        # and asserts it is listed above, so renaming a build workflow is a red job here
+        # instead of a drift check that quietly stopped reacting to builds.
+        run: |
+          set -euo pipefail
+
+          SELF='.github/workflows/version-drift-check.yml'
+          broken=0
+
+          for f in "$KERNEL_WORKFLOW" "$KERNEL_WORKFLOW_ORACLE" "$SCX_WORKFLOW"; do
+            path=".github/workflows/$f"
+            if [ ! -f "$path" ]; then
+              echo "::error title=Workflow missing::$path does not exist, so neither the workflow_run trigger nor dispatch can reference it"
+              broken=1
+              continue
+            fi
+
+            # First top-level `name:` line, unquoted, trailing whitespace stripped.
+            wfname="$(sed -n 's/^name:[[:space:]]*//p' "$path" | head -1 | sed 's/[[:space:]]*$//; s/^"\(.*\)"$/\1/; s/^'"'"'\(.*\)'"'"'$/\1/')"
+            if [ -z "$wfname" ]; then
+              echo "::error title=Unnamed workflow::could not read a top-level name: from $path"
+              broken=1
+              continue
+            fi
+
+            if grep -qxF "      - $wfname" "$SELF"; then
+              echo "ok: workflow_run watches \"$wfname\" ($f)"
+            else
+              echo "::error title=workflow_run wiring broken::$f is named \"$wfname\" but that name is not in the on.workflow_run.workflows list in $SELF, so its completion never triggers this check"
+              broken=1
+            fi
+          done
+
+          # Cross-check against what GitHub itself has registered. A workflow that has never
+          # run on the default branch is not registered, and workflow_run cannot resolve it.
+          REGISTERED="$(gh api --paginate "repos/$GITHUB_REPOSITORY/actions/workflows" --jq '.workflows[].path')"
+          for f in "$KERNEL_WORKFLOW" "$SCX_WORKFLOW"; do
+            if printf '%s\n' "$REGISTERED" | grep -qxF ".github/workflows/$f"; then
+              echo "ok: dispatch target $f is registered with GitHub Actions"
+            else
+              echo "::error title=Dispatch target unregistered::.github/workflows/$f is not registered with GitHub Actions, so gh workflow run cannot start it"
+              broken=1
+            fi
+          done
+
+          [ "$broken" = 0 ] || exit 1
 
       - name: Resolve upstream and released versions
         id: resolve
@@ -96,8 +195,10 @@ jobs:
           [ -n "$MAINLINE_KERNEL" ] || MAINLINE_KERNEL='unknown'
 
           # --- upstream: latest sched-ext/scx release -----------------------------------
-          UPSTREAM_SCX="$(gh api repos/sched-ext/scx/releases/latest --jq '.tag_name')"
-          UPSTREAM_SCX_DATE="$(gh api repos/sched-ext/scx/releases/latest --jq '.published_at')"
+          # One API call, parsed twice, instead of two calls that could straddle a release.
+          SCX_LATEST="$(gh api repos/sched-ext/scx/releases/latest)"
+          UPSTREAM_SCX="$(printf '%s' "$SCX_LATEST" | jq -r '.tag_name')"
+          UPSTREAM_SCX_DATE="$(printf '%s' "$SCX_LATEST" | jq -r '.published_at')"
 
           # --- ours: newest kernel release and newest scx release in this repo ----------
           # Kernel releases are tagged vX.Y.Z-cachyos-...; scx releases are tagged scx-vX.Y.Z-...
@@ -110,7 +211,7 @@ jobs:
           # RC tags (vX.Y.rcN-...) are intentionally NOT matched: linux-cachyos-server
           # always carries a stable pkgver, so comparing it to an RC build is meaningless.
           # If only RC releases existed the kernel version resolves empty and the check
-          # goes red, which is the correct loud outcome rather than a silent pass.
+          # reports drift, which is the correct loud outcome rather than a silent pass.
           RELEASES="$(gh release list --repo "$GITHUB_REPOSITORY" --limit 100 --json tagName --jq '.[].tagName')"
 
           OURS_KERNEL="$(printf '%s\n' "$RELEASES" \
@@ -126,39 +227,162 @@ jobs:
           # counted as drift.
           norm() { printf '%s' "$1" | awk -F. '{printf "%d.%d.%d", $1, ($2==""?0:$2), ($3==""?0:$3)}'; }
 
+          UKN="$(norm "$UPSTREAM_KERNEL")"
+          OKN="$(norm "${OURS_KERNEL:-0}")"
+
+          kernel_state='current'
+          scx_state='current'
+          [ "$UKN" = "$OKN" ]                       || kernel_state='DRIFT'
+          [ "$UPSTREAM_SCX" = "${OURS_SCX:-none}" ] || scx_state='DRIFT'
+
           {
             echo "upstream_kernel=$UPSTREAM_KERNEL"
-            echo "upstream_kernel_n=$(norm "$UPSTREAM_KERNEL")"
+            echo "upstream_kernel_n=$UKN"
             echo "mainline_kernel=$MAINLINE_KERNEL"
             echo "ours_kernel=${OURS_KERNEL:-none}"
-            echo "ours_kernel_n=$(norm "${OURS_KERNEL:-0}")"
+            echo "ours_kernel_n=$OKN"
             echo "ours_kernel_tag=${OURS_KERNEL_TAG:-none}"
             echo "upstream_scx=$UPSTREAM_SCX"
             echo "upstream_scx_date=$UPSTREAM_SCX_DATE"
             echo "ours_scx=${OURS_SCX:-none}"
             echo "ours_scx_tag=${OURS_SCX_TAG:-none}"
+            echo "kernel_state=$kernel_state"
+            echo "scx_state=$scx_state"
           } >> "$GITHUB_OUTPUT"
 
-      - name: Report and fail on drift
+      - name: Trigger the matching build on drift
+        id: trigger
+        # RECURSION GUARD, and the reason this is an `if:` rather than a runtime check.
+        # workflow_dispatch is one of the two events GitHub explicitly exempts from the
+        # "events triggered by GITHUB_TOKEN do not create a new workflow run" rule, so a
+        # dispatch from here really does start a build, whose completion really does fire
+        # this workflow again through workflow_run. Without this gate, a build that fails -
+        # or one whose pre-flight skips while drift persists - re-dispatches itself forever.
+        # Gating on the event makes the cron the only dispatch clock: a build completion can
+        # report, but can never re-arm the build.
+        #
+        # The auto_build clause is written as an event guard, NOT as `inputs.auto_build !=
+        # false`. On a schedule event there is no `inputs` context, so `inputs.auto_build` is
+        # null, and GitHub compares mixed types by casting both to numbers: null becomes 0 and
+        # false becomes 0, so `null != false` is FALSE. Written the obvious way, this step
+        # would silently never run on cron, which is the only trigger allowed to dispatch.
+        # Guarding on the event first short-circuits before the input is ever read.
+        if: >-
+          github.event_name != 'workflow_run' &&
+          (github.event_name != 'workflow_dispatch' || inputs.auto_build) &&
+          (steps.resolve.outputs.kernel_state == 'DRIFT' || steps.resolve.outputs.scx_state == 'DRIFT')
+        env:
+          KERNEL_STATE: ${{ steps.resolve.outputs.kernel_state }}
+          SCX_STATE: ${{ steps.resolve.outputs.scx_state }}
         run: |
           set -euo pipefail
-          UK='${{ steps.resolve.outputs.upstream_kernel }}'
-          UKN='${{ steps.resolve.outputs.upstream_kernel_n }}'
-          MK='${{ steps.resolve.outputs.mainline_kernel }}'
-          OK='${{ steps.resolve.outputs.ours_kernel }}'
-          OKN='${{ steps.resolve.outputs.ours_kernel_n }}'
-          OKT='${{ steps.resolve.outputs.ours_kernel_tag }}'
-          US='${{ steps.resolve.outputs.upstream_scx }}'
-          USD='${{ steps.resolve.outputs.upstream_scx_date }}'
-          OS='${{ steps.resolve.outputs.ours_scx }}'
-          OST='${{ steps.resolve.outputs.ours_scx_tag }}'
-          CV='${{ env.CACHY_VARIANT }}'
 
-          drift=0
-          kernel_state='current'
-          scx_state='current'
-          [ "$UKN" = "$OKN" ] || { kernel_state='DRIFT'; drift=1; }
-          [ "$US"  = "$OS"  ] || { scx_state='DRIFT';    drift=1; }
+          # workflow_dispatch resolves only against the default branch. On a schedule trigger
+          # the checked-out ref already is that branch, but ask the API rather than
+          # hardcoding "master" so a future default-branch rename does not silently break
+          # remediation.
+          REF="$(gh api "repos/$GITHUB_REPOSITORY" --jq '.default_branch')"
+
+          # A build already queued or running IS the remediation. Dispatching a second one is
+          # not harmful - both build workflows use a non-cancelling concurrency group, and
+          # their pre-flight steps skip a version that already has a release - but it is pure
+          # noise, so report the in-flight run instead.
+          in_flight() {
+            local wf="$1" n
+            n="$(gh run list --repo "$GITHUB_REPOSITORY" --workflow "$wf" --limit 30 \
+                   --json status \
+                   --jq '[.[] | select(.status == "in_progress" or .status == "queued" or .status == "waiting" or .status == "requested" or .status == "pending")] | length')"
+            [ "${n:-0}" -gt 0 ]
+          }
+
+          # No force input is passed on purpose. Each build workflow's pre-flight skips a
+          # version that already has a release, and that idempotency is exactly what makes a
+          # redundant dispatch harmless. Forcing would remove it and race the daily cron.
+          fire() {
+            local wf="$1" label="$2" out="$3"
+            if in_flight "$wf"; then
+              echo "::notice title=$label build already running::skipping dispatch of $wf, a run is queued or in progress"
+              echo "$out=in-flight" >> "$GITHUB_OUTPUT"
+              return 0
+            fi
+            if gh workflow run "$wf" --repo "$GITHUB_REPOSITORY" --ref "$REF"; then
+              echo "::notice title=$label build dispatched::$wf started on $REF to clear the drift"
+              echo "$out=dispatched" >> "$GITHUB_OUTPUT"
+            else
+              echo "::error title=$label dispatch failed::could not start $wf"
+              echo "$out=failed" >> "$GITHUB_OUTPUT"
+              return 1
+            fi
+          }
+
+          # Kernel drift dispatches the GitHub-hosted x86 build ONLY, never the Oracle A1
+          # cross build. That one is the 12 h-later fallback for when this one fails, it runs
+          # on a self-hosted runner that may be powered down (a dispatch would queue
+          # indefinitely rather than fail), and racing both can publish two releases for one
+          # kernel version. Its own cron still covers the fallback case.
+          rc=0
+          if [ "$KERNEL_STATE" = 'DRIFT' ]; then
+            fire "$KERNEL_WORKFLOW" kernel kernel_action || rc=1
+          else
+            echo "kernel_action=not-needed" >> "$GITHUB_OUTPUT"
+          fi
+          if [ "$SCX_STATE" = 'DRIFT' ]; then
+            fire "$SCX_WORKFLOW" scx scx_action || rc=1
+          else
+            echo "scx_action=not-needed" >> "$GITHUB_OUTPUT"
+          fi
+          exit "$rc"
+
+      - name: Report and decide status
+        if: always() && steps.resolve.outcome == 'success'
+        env:
+          # Every value that reaches this shell arrives through env and is quoted on use.
+          # Nothing is pasted into the script body, so an upstream tag or release title can
+          # never be parsed as shell.
+          UK: ${{ steps.resolve.outputs.upstream_kernel }}
+          MK: ${{ steps.resolve.outputs.mainline_kernel }}
+          OURS_K: ${{ steps.resolve.outputs.ours_kernel }}
+          OKT: ${{ steps.resolve.outputs.ours_kernel_tag }}
+          US: ${{ steps.resolve.outputs.upstream_scx }}
+          USD: ${{ steps.resolve.outputs.upstream_scx_date }}
+          OURS_S: ${{ steps.resolve.outputs.ours_scx }}
+          OST: ${{ steps.resolve.outputs.ours_scx_tag }}
+          KERNEL_STATE: ${{ steps.resolve.outputs.kernel_state }}
+          SCX_STATE: ${{ steps.resolve.outputs.scx_state }}
+          # Empty when the trigger step was skipped: no drift, workflow_run trigger, or
+          # auto_build=false on a manual run.
+          KERNEL_ACTION: ${{ steps.trigger.outputs.kernel_action }}
+          SCX_ACTION: ${{ steps.trigger.outputs.scx_action }}
+          EVENT: ${{ github.event_name }}
+          AUTO_BUILD: ${{ inputs.auto_build }}
+          RUNS_URL: ${{ github.server_url }}/${{ github.repository }}/actions
+        run: |
+          set -euo pipefail
+
+          CV="$CACHY_VARIANT"
+
+          # Per component, describe what is being done about the drift. "unhandled" and
+          # "dispatch FAILED" are the only states that fail the job.
+          describe() {
+            local state="$1" action="$2"
+            if [ "$state" != 'DRIFT' ]; then
+              printf 'current'
+              return
+            fi
+            case "$action" in
+              dispatched) printf 'DRIFT - build dispatched' ;;
+              in-flight)  printf 'DRIFT - build already running' ;;
+              failed)     printf 'DRIFT - dispatch FAILED' ;;
+              *)          printf 'DRIFT - unhandled' ;;
+            esac
+          }
+
+          KERNEL_LINE="$(describe "$KERNEL_STATE" "${KERNEL_ACTION:-}")"
+          SCX_LINE="$(describe "$SCX_STATE" "${SCX_ACTION:-}")"
+
+          fail=0
+          case "$KERNEL_LINE" in *unhandled | *FAILED) fail=1 ;; esac
+          case "$SCX_LINE"    in *unhandled | *FAILED) fail=1 ;; esac
 
           # Mainline lag is reported, never failed on. Nothing in this repo can make CachyOS
           # rebase onto a newer stable, so a red check here would be an alarm with no fix.
@@ -170,8 +394,8 @@ jobs:
             echo
             echo "| component | upstream latest | this repo released | state |"
             echo "| --- | --- | --- | --- |"
-            echo "| Linux kernel (CachyOS \`$CV\` PKGBUILD) | \`$UK\` | \`$OK\` | $kernel_state |"
-            echo "| sched-ext/scx | \`$US\` | \`$OS\` | $scx_state |"
+            echo "| Linux kernel (CachyOS \`$CV\` PKGBUILD) | \`$UK\` | \`$OURS_K\` | $KERNEL_LINE |"
+            echo "| sched-ext/scx | \`$US\` | \`$OURS_S\` | $SCX_LINE |"
             echo
             echo "Newest kernel release tag: \`$OKT\`"
             echo "Newest scx release tag: \`$OST\`"
@@ -184,19 +408,59 @@ jobs:
             echo "kernel.org tarball, so the PKGBUILD version above is what the pipeline can"
             echo "actually track. Mainline is shown so CachyOS falling behind stays visible."
             echo
-            if [ "$drift" = 0 ]; then
+            if [ "$KERNEL_STATE" = 'current' ] && [ "$SCX_STATE" = 'current' ]; then
               echo "Both components match their upstream. Nothing pinned, nothing stale."
+            elif [ "$fail" = 0 ]; then
+              echo "### Remediation in flight"
+              echo
+              echo "Drift was found and the matching build workflow is running, so this check"
+              echo "passes. It fails only if the drift is still there once that build has"
+              echo "completed and reported back here."
+              echo
+              echo "[Watch the running builds]($RUNS_URL)"
             else
-              echo "Drift detected. This is expected for a short window after an upstream"
-              echo "release and clears itself once the matching build workflow publishes a"
-              echo "release. If it persists, the build workflow is not firing - check"
-              echo "\`build-cachyos-server.yml\` and \`build-scx-schedulers.yml\`."
+              echo "### Drift is not being remediated"
+              echo
+              if [ "$EVENT" = 'workflow_run' ]; then
+                echo "A build workflow just completed and the drift is still present. Either the"
+                echo "build failed, or its pre-flight skipped a version that never produced a"
+                echo "release. Check the run that triggered this check."
+                echo
+                echo "This check deliberately does not dispatch on a \`workflow_run\` trigger:"
+                echo "that would let a failing build re-dispatch itself forever. The 4-hourly"
+                echo "cron retries on its next tick."
+              elif [ "$AUTO_BUILD" = 'false' ]; then
+                echo "Auto-dispatch was turned off for this manual run (\`auto_build: false\`),"
+                echo "so the drift was reported and nothing was started."
+              else
+                echo "Dispatching a build workflow failed. Check the \`actions: write\`"
+                echo "permission on this job and that the target workflow still exists on the"
+                echo "default branch."
+              fi
             fi
           } >> "$GITHUB_STEP_SUMMARY"
 
-          if [ "$drift" != 0 ]; then
-            [ "$kernel_state" = 'current' ] || echo "::error title=Kernel drift::CachyOS $CV PKGBUILD is $UK but the newest release here is $OK"
-            [ "$scx_state"    = 'current' ] || echo "::error title=scx drift::upstream latest is $US but the newest release here is $OS"
+          if [ "$KERNEL_STATE" = 'DRIFT' ]; then
+            echo "kernel: CachyOS $CV PKGBUILD is $UK, newest release here is $OURS_K ($KERNEL_LINE)"
+          fi
+          if [ "$SCX_STATE" = 'DRIFT' ]; then
+            echo "scx: upstream latest is $US, newest release here is $OURS_S ($SCX_LINE)"
+          fi
+
+          if [ "$fail" != 0 ]; then
+            case "$KERNEL_LINE" in
+              *unhandled | *FAILED)
+                echo "::error title=Kernel drift unremediated::CachyOS $CV PKGBUILD is $UK but the newest release here is $OURS_K, and no build is running"
+                ;;
+            esac
+            case "$SCX_LINE" in
+              *unhandled | *FAILED)
+                echo "::error title=scx drift unremediated::upstream latest is $US but the newest release here is $OURS_S, and no build is running"
+                ;;
+            esac
             exit 1
           fi
-          echo "kernel $OK matches CachyOS $CV ($UK); scx $OS matches upstream latest"
+
+          if [ "$KERNEL_STATE" = 'current' ] && [ "$SCX_STATE" = 'current' ]; then
+            echo "kernel $OURS_K matches CachyOS $CV ($UK); scx $OURS_S matches upstream latest"
+          fi

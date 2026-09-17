@@ -1,0 +1,13 @@
+# actionlint configuration.
+#
+# self-hosted-runner.labels declares the custom runner labels this repo uses, so
+# actionlint stops reporting them as unknown. Only build-cachyos-server-oracle.yml
+# uses one: the Oracle Cloud A1 ARM64 machine that runs the fallback cross-build.
+self-hosted-runner:
+  labels:
+    - oracle-a1
+
+# null leaves the configuration-variable check disabled, which is correct here:
+# no workflow in this repo reads `vars.*`. If one ever does, replace this with the
+# explicit list of allowed variable names so a typo becomes a lint error.
+config-variables: null

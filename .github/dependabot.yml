@@ -10,3 +10,26 @@ updates:
     open-pull-requests-limit: 5
     labels:
       - dependencies
+    # Every action in this repo is pinned to a commit SHA with the tag in a trailing comment.
+    # Dependabot understands that form and rewrites both, which is the only reason SHA
+    # pinning is maintainable here.
+    commit-message:
+      prefix: build(deps)
+      include: scope
+    # One PR per week for all action bumps instead of one PR per action. The workflows
+    # change together anyway, and a single grouped PR is one CI run and one review rather
+    # than five of each.
+    groups:
+      github-actions:
+        patterns:
+          - '*'
+        update-types:
+          - minor
+          - patch
+      # Majors stay ungrouped and separate: an actions/checkout v7 to v8 jump can change
+      # inputs or runtime, and that deserves its own PR and its own CI run.
+      github-actions-major:
+        patterns:
+          - '*'
+        update-types:
+          - major
