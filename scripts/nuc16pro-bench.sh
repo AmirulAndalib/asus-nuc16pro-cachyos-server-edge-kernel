@@ -33,6 +33,14 @@
 #     interrupt or error. An aborted run cannot strand the box in stock or ultimate.
 #   - Every apply is idempotent and every value it writes is captured first.
 #
+# HOW THIS REACHES THE BOX
+#   It does not, and that is deliberate. Every other operational script here is spliced
+#   into the kernel updater through an @@FILE:...@@ marker and installed under
+#   /usr/local/sbin. This one is an operator tool, not part of the runtime: it is run from
+#   a checkout (copy it over, or run it from a clone on the box) and it is intentionally
+#   NOT deployed, because nothing on the box should be able to start flipping the machine
+#   between tuning profiles on a timer. There is no marker for it and none should be added.
+#
 # USAGE
 #   sudo -A ./nuc16pro-bench.sh all
 #   PAIRS=7 DUR=20 ./nuc16pro-bench.sh all

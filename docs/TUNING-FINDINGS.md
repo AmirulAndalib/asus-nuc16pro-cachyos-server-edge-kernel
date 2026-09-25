@@ -593,12 +593,16 @@ Interface counters since boot make it unambiguous:
 | interface | rx | tx |
 | --------- | -- | -- |
 | wlo1 | 21 GB | **467 GB** |
-| bond0 | 7 GB | **0 GB** |
+| bond0 | 7 GB | **0 GB** (see note) |
 | enp86s0 | 3 GB | 0 GB |
 | enp87s0 | 3 GB | 0 GB |
 
 Measured directly: an iperf3 transfer of 3053 MB moved 3053 MB on wlo1 and exactly 0 on
 bond0 and both of its slaves.
+
+Note on that zero: it was zero at the moment of discovery, before anything in this audit ran.
+bond0's counter is no longer zero today, because the `--bind-dev` comparison further down this
+section deliberately forced about 4 GB through it. Nothing else has ever used it.
 
 Inbound still arrives over ethernet (bond0 rx is 7 GB) because the switch ARPs for the bond's
 address and the link answers. Outbound leaves over WiFi. That asymmetry is precisely why
