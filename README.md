@@ -101,7 +101,7 @@ established by measurement; the number behind them is in
 | Swappiness             | `vm.swappiness=10` (swap only under real pressure; zswap absorbs the rest)                                                                           |
 | Cache pressure         | `vm.vfs_cache_pressure=50` (keep dentry/inode cache for ~80 containers)                                                                              |
 | Dirty writeback        | `vm.dirty_background_ratio=5`, `vm.dirty_ratio=20`                                                                                                 |
-| Known ceiling          | RAM capacity is the box's real bottleneck, not a tunable ([audit](docs/TUNING-FINDINGS.md#11-hardware-ceiling-audit))                                   |
+| Known ceiling          | RAM capacity is the tightest resource, but PSI says it is not stalling: idle `memory some avg10=0.00 avg60=0.00`, MemAvailable ~14GB ([audit](docs/TUNING-FINDINGS.md#11-hardware-ceiling-audit))                                   |
 
 ### Storage and I/O
 

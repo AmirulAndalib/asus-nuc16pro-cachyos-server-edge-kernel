@@ -26,11 +26,15 @@ on:
       - '.github/workflows/**'
       - '.github/actionlint.yaml'
       - 'scripts/**'
+      - '**/*.md'
+      - 'netplan/**'
   pull_request:
     paths:
       - '.github/workflows/**'
       - '.github/actionlint.yaml'
       - 'scripts/**'
+      - '**/*.md'
+      - 'netplan/**'
   workflow_dispatch: {}
 
 permissions: {}
@@ -256,4 +260,48 @@ jobs:
           fi
 
           echo "::error file=scripts/nuc16pro-kernel-updater.sh,title=Generated file out of sync::edit scripts/nuc16pro-kernel-updater.sh.in (or the tracked modprobe.d/, sysctl.d/, udev/, systemd/ sources), run scripts/assemble-kernel-updater.sh, and commit the result"
+          exit 1
+
+  repo-audit:
+    name: repo audit (links, host data, style, wiring)
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          persist-credentials: false
+          # repo-audit greps tracked files via `git ls-files`, so it needs a real work tree.
+          fetch-depth: 1
+
+      - name: Install PyYAML
+        run: python3 -m pip install --quiet --disable-pip-version-check pyyaml
+
+      - name: Run repo audit
+        run: |
+          set -uo pipefail
+          # These checks used to live in a session scratchpad and were lost when the session
+          # ended. They cover what actionlint and shellcheck cannot see: dead markdown
+          # anchors, host-specific data, em dashes, unresolvable workflow_run targets, and
+          # splice markers pointing at files that no longer exist.
+          chmod +x scripts/repo-audit.sh
+          if scripts/repo-audit.sh -v | tee audit.out; then
+            {
+              echo "## repo audit: clean"
+              echo
+              echo '```'
+              cat audit.out
+              echo '```'
+            } >> "$GITHUB_STEP_SUMMARY"
+            exit 0
+          fi
+          {
+            echo "## repo audit: FAILED"
+            echo
+            echo '```'
+            cat audit.out
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
           exit 1

@@ -274,5 +274,146 @@ if systemctl cat bluetooth.service >/dev/null 2>&1; then
   note "bluetooth: $(systemctl is-enabled bluetooth.service 2>/dev/null) / $(systemctl is-active bluetooth.service 2>/dev/null) (used by Home Assistant BLE)"
 fi
 
+sec saturation
+# Added after a 2026-09-26 audit had to hand-query all of this. These are the numbers that
+# say whether the box is actually under stress, as opposed to merely looking busy.
+#
+# PSI is the honest signal and it is deliberately preferred over MemFree here. MemFree on this
+# box reads ~300MB and looks alarming, but that is the page cache doing its job; MemAvailable
+# is ~14GB and PSI memory pressure is ~0. Reporting MemFree as a health number would
+# manufacture a problem that does not exist, which is exactly the failure mode section 12 of
+# docs/TUNING-FINDINGS.md exists to prevent.
+if [ -r /proc/pressure/cpu ]; then
+  for res in cpu memory io; do
+    line=$(head -1 "/proc/pressure/$res" 2>/dev/null)
+    a10=$(printf '%s' "$line"  | sed -n 's/.*avg10=\([0-9.]*\).*/\1/p')
+    a60=$(printf '%s' "$line"  | sed -n 's/.*avg60=\([0-9.]*\).*/\1/p')
+    note "PSI $res: some avg10=${a10:-?} avg60=${a60:-?}"
+    # Flag only sustained stall. A spike in avg10 is normal on a box running ~90 containers;
+    # avg60 above 20% means real work is waiting on that resource for a full minute.
+    case "$res" in
+      memory|io)
+        if [ -n "$a60" ] && awk -v v="$a60" 'BEGIN{exit !(v>20)}' 2>/dev/null; then
+          flag "PSI $res stall avg60=${a60}% - sustained pressure, not a transient spike"
+        fi ;;
+    esac
+  done
+fi
+mem_avail=$(awk '/^MemAvailable:/{printf "%d", $2/1024}' /proc/meminfo 2>/dev/null)
+mem_total=$(awk '/^MemTotal:/{printf "%d", $2/1024}' /proc/meminfo 2>/dev/null)
+[ -n "$mem_avail" ] && note "memory available: ${mem_avail}MB of ${mem_total}MB (MemFree alone is misleading here: most of RAM is page cache)"
+# zswap refault: how much of what was compressed out had to be pulled straight back. High is a
+# sign the pool is under-sized for the working set, which is a capacity fact, not a bug.
+if [ -r /proc/vmstat ]; then
+  zrf=$(awk '/^zswpout /{o=$2} /^zswpin /{i=$2} END{ if(o>0) printf "%d", 100*i/o }' /proc/vmstat 2>/dev/null)
+  [ -n "$zrf" ] && note "zswap refault: ${zrf}% of writeouts were read back"
+fi
+# conntrack: ~90 containers plus a torrent client is the workload most likely to exhaust this
+# table, and a full table silently drops new connections. Audited at 4426/262144 (2%), so this
+# is headroom reporting, not a known problem.
+ctmax=$(cat /proc/sys/net/netfilter/nf_conntrack_max 2>/dev/null)
+ctcnt=$(cat /proc/sys/net/netfilter/nf_conntrack_count 2>/dev/null)
+if [ -n "$ctmax" ] && [ -n "$ctcnt" ] && [ "$ctmax" -gt 0 ] 2>/dev/null; then
+  ctpct=$(( 100 * ctcnt / ctmax ))
+  note "conntrack: ${ctcnt}/${ctmax} (${ctpct}%)"
+  [ "$ctpct" -ge 80 ] && flag "conntrack table ${ctpct}% full - new connections will start dropping"
+fi
+fdused=$(awk '{print $1}' /proc/sys/fs/file-nr 2>/dev/null)
+fdmax=$(cat /proc/sys/fs/file-max 2>/dev/null)
+[ -n "$fdused" ] && [ -n "$fdmax" ] && note "open file descriptors: ${fdused}/${fdmax}"
+
+sec device-health
+# NVMe wear and integrity. media_errors and critical_warning are genuine defects and are
+# flagged; percentage_used is lifetime consumed and is only worth a warning near end of life.
+# unsafe_shutdowns is deliberately NOT flagged: the Micron 2200 in this box reports a
+# spuriously high count (a known firmware quirk), so warning on it would be crying wolf.
+if command -v nvme >/dev/null 2>&1 && [ "$(id -u)" -eq 0 ]; then
+  for dev in /dev/nvme0n1 /dev/nvme1n1; do
+    [ -e "$dev" ] || continue
+    log=$(nvme smart-log "$dev" 2>/dev/null) || continue
+    model=$(cat "/sys/block/$(basename "$dev")/device/model" 2>/dev/null | tr -s ' ')
+    cw=$(printf '%s' "$log"  | awk -F: '/critical_warning/{gsub(/ /,"",$2); print $2; exit}')
+    pu=$(printf '%s' "$log"  | awk -F: '/percentage_used/{gsub(/[ %]/,"",$2); print $2; exit}')
+    me=$(printf '%s' "$log"  | awk -F: '/media_errors/{gsub(/ /,"",$2); print $2; exit}')
+    # smart-log prints "temperature : 52 C (325 K, 125 F)"; take the FIRST number only,
+    # otherwise every digit on the line concatenates into nonsense like 42315107.
+    tp=$(printf '%s' "$log"  | awk -F: '/^temperature/{print $2; exit}' | grep -oE '[0-9]+' | head -1)
+    note "$(basename "$dev") ${model}: wear=${pu:-?}% temp=${tp:-?}C media_errors=${me:-?}"
+    [ "${cw:-0}" != "0" ] && flag "$(basename "$dev") SMART critical_warning=$cw"
+    [ -n "$me" ] && [ "$me" != "0" ] && flag "$(basename "$dev") has $me media errors"
+    [ -n "$pu" ] && [ "$pu" -ge 90 ] 2>/dev/null && flag "$(basename "$dev") is ${pu}% through its rated write life"
+  done
+fi
+# Thermal throttling is REPORTED, never flagged. BIOS owns PL1/PL2 and the fan curve on this
+# box, and the 356H is silicon-capped at 80W MTP, so brief TjMax excursions under burst are
+# the designed behaviour rather than a fault the OS should complain about.
+thr=$(cat /sys/devices/system/cpu/cpu0/thermal_throttle/package_throttle_count 2>/dev/null)
+[ -n "$thr" ] && note "package throttle events since boot: $thr (BIOS owns the power/thermal envelope)"
+
+sec net-steering
+# Receive-side steering state. RPS/RFS are currently UNSET and that is not asserted either
+# way: spreading softirq work across the P/E/LP-E cores is a plausible win but was never
+# measured on this box, and section 12 forbids shipping a tuning change on mechanism alone.
+# This section exists so the state is visible the next time someone proposes it.
+for i in $(ls /sys/class/net 2>/dev/null | grep -E '^en'); do
+  rq=$(ls -d /sys/class/net/"$i"/queues/rx-* 2>/dev/null | wc -l)
+  rps=$(cat /sys/class/net/"$i"/queues/rx-0/rps_cpus 2>/dev/null | tr -d ',0')
+  if [ -z "$rps" ]; then rps_state="off"; else rps_state="on"; fi
+  note "$i: rx queues=${rq} rps=${rps_state}"
+  rxd=$(cat /sys/class/net/"$i"/statistics/rx_dropped 2>/dev/null)
+  rxe=$(cat /sys/class/net/"$i"/statistics/rx_errors 2>/dev/null)
+  [ -n "$rxe" ] && [ "$rxe" -gt 0 ] 2>/dev/null && flag "$i has $rxe rx errors"
+  [ -n "$rxd" ] && [ "$rxd" -gt 1000 ] 2>/dev/null && flag "$i has $rxd rx drops"
+done
+
+sec update-pipeline
+# The repo's whole promise is "always latest, never pinned", and that promise rests entirely
+# on the updater timer actually firing. Nothing surfaced when it stopped: a 2026-09-26 audit
+# found the box still running the updater script from e8df4f1 (three commits behind master)
+# with no signal anywhere. The kernel itself was current, so the pipeline was working, but a
+# silently dead timer would have looked exactly the same from outside.
+#
+# This section answers the question that actually matters: is the update path still running?
+# It deliberately does NOT fetch anything from the network. A health report should not depend
+# on GitHub being reachable, and it must never execute remote code to decide it is healthy.
+if systemctl cat nuc16pro-kernel-updater.timer >/dev/null 2>&1; then
+  tstate="$(systemctl is-enabled nuc16pro-kernel-updater.timer 2>/dev/null)/$(systemctl is-active nuc16pro-kernel-updater.timer 2>/dev/null)"
+  note "updater timer: $tstate"
+  case "$tstate" in
+    enabled/active) ;;
+    *) flag "updater timer is $tstate - the box will silently stop tracking upstream" ;;
+  esac
+  res="$(systemctl show -p Result --value nuc16pro-kernel-updater.service 2>/dev/null)"
+  [ -n "$res" ] && note "last updater run result: $res"
+  [ -n "$res" ] && [ "$res" != "success" ] && flag "last updater run result was '$res'"
+fi
+# Age of the last successful install. A pipeline that has not installed anything for weeks is
+# either genuinely up to date or quietly broken; the tag plus its age lets a human tell which.
+for f in /var/lib/nuc16pro-kernel-updater/last-installed-tag /var/lib/nuc16pro-kernel-updater/last-installed-scx-tag; do
+  [ -r "$f" ] || continue
+  tag="$(cat "$f" 2>/dev/null)"
+  mt="$(stat -c %Y "$f" 2>/dev/null)"
+  if [ -n "$mt" ]; then
+    age=$(( ( $(date +%s) - mt ) / 86400 ))
+    note "$(basename "$f"): $tag (${age}d ago)"
+    # Age is REPORTED, never flagged. A first draft of this check warned at 30 days and
+    # immediately cried wolf: the scx tag was 36 days old because sched-ext/scx had not cut
+    # a release in 36 days, not because anything was broken. Staleness relative to upstream
+    # is a question only the drift check can answer, and version-drift-check.yml already
+    # answers it against the real upstream every 4 hours. Duplicating that here with a
+    # calendar heuristic would produce exactly the kind of warning people learn to ignore.
+    :
+  else
+    note "$(basename "$f"): $tag"
+  fi
+done
+# Deployed updater identity. Reported, not asserted: the healthcheck has no trustworthy local
+# copy of what master currently holds, so comparing here would either need the network or a
+# stamp that can itself go stale. Printing the checksum lets a human or CI compare it against
+# `md5sum scripts/nuc16pro-kernel-updater.sh` in the repo in one step.
+if [ -r /usr/local/sbin/nuc16pro-kernel-updater.sh ]; then
+  note "deployed updater: md5=$(md5sum /usr/local/sbin/nuc16pro-kernel-updater.sh 2>/dev/null | cut -d' ' -f1) mtime=$(date -d "@$(stat -c %Y /usr/local/sbin/nuc16pro-kernel-updater.sh)" +%Y-%m-%d 2>/dev/null)"
+fi
+
 echo "==== summary: warnings=$warn ===="
 exit 0
