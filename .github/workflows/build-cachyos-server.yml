@@ -424,10 +424,12 @@ jobs:
 
           - CPU freq: \`intel_pstate\` active + HWP, \`powersave\` governor with \`EPP=performance\` and \`hwp_dynamic_boost=1\`. Hardware scales each core idle->full turbo on demand; a pinned \`performance\` governor is deliberately avoided so idle cores release power budget to loaded cores under the 80 W MTP cap.
           - ACPI platform_profile: \`performance\` (firmware DPTF power slider to max)
-          - sched_ext: \`scx_flash\` primary (EDF, latency-weighted); fallback \`scx_bpfland\` -> \`scx_p2dq\` -> \`scx_rusty\` -> \`scx_beerland\` -> \`scx_lavd\`. Kernel also bakes scx_bpfland as the compiled-in auto-enable.
+          - sched_ext: \`scx_flash\` primary (EDF, latency-weighted); fallback \`scx_bpfland\` -> \`scx_p2dq\` -> \`scx_rusty\` -> \`scx_beerland\` -> \`scx_lavd\`. sched_ext itself is compiled in (\`CONFIG_SCHED_CLASS_EXT=y\`); the schedulers are BPF programs loaded from userspace by \`scx_loader\`, so the kernel does not bake one in.
           - GPU: \`xe\` (Intel Xe3-LP Panther Lake, GuC/HuC auto-enabled); VA-API AV1 / HEVC / H.264 / VP9 encode + decode
-          - zswap: \`zstd\` / \`zsmalloc\` / \`20%\` (z3fold removed upstream)
-          - I/O scheduler: \`adios\`; THP \`always\`; io_uring / XDP sockets / TLS offload enabled
+          - zswap: \`zstd\` / \`zsmalloc\` / \`30%\` (z3fold removed upstream). Raised from 20% after measuring 12.77M writeouts against 7.88M readins: the pool was too small to hold the working set, so pages were pushed out and pulled straight back off the encrypted root.
+          - I/O scheduler: \`adios\`; io_uring / XDP sockets / TLS offload enabled
+          - THP: \`always\`, **plus multi-size THP (mTHP) orders 16k/32k/64k enabled**. Measured on this hardware: with only the 2MB PMD order available, 81% of THP faults fell back to 4k pages; enabling the mid orders took per-order success to 93-97%.
+          - dm-crypt: \`no_read_workqueue\` + \`no_write_workqueue\` on every LUKS device. With hardware AES (VAES/AVX2) the encryption is cheaper than the workqueue round-trip it replaces.
           - NVMe power states off (\`nvme_core.default_ps_max_latency_us=0\`); TCP \`bbr\` + \`fq\`
           - CPU vulnerability mitigations: \`auto\` (kept on - internet-exposed)
 
