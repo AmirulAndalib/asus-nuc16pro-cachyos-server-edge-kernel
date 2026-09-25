@@ -126,7 +126,7 @@ established by measurement; the number behind them is in
 | TCP Fast Open       | `net.ipv4.tcp_fastopen=3` (client and server)                               |
 | Socket buffers      | `rmem_max`/`wmem_max` 128MB, `tcp_rmem`/`tcp_wmem` autotuned to 128MB |
 | Backlog             | `net.core.netdev_max_backlog=16384`                                         |
-| Bonding             | 2x 2.5GbE bonded (balance-xor, static LAG; see section 5); WiFi 7 failover    |
+| Bonding             | 2x 2.5GbE bonded (balance-xor, static LAG; see section 5). **Currently inert: bond0 has no route and carries no outbound traffic; egress is WiFi 7 MLO** ([finding 17](docs/TUNING-FINDINGS.md#17-the-25gbe-bond-carries-no-outbound-traffic-wifi-7-mlo-is-the-real-path-2026-09-26)) |
 | Reverse path filter | `rp_filter=2` loose, required for asymmetric paths across bond0 + wlo1      |
 | igc ring buffers    | rx=4096 tx=4096 on both I226-V 2.5GbE ports                                   |
 | Network offload     | TLS kernel offload, XDP sockets                                               |
@@ -412,7 +412,9 @@ scxctl start --scheduler scx_flash --mode Server
 
 ### 5. Network: dual 2.5GbE bond + WiFi failover
 
-The box has two Intel I226-V 2.5GbE ports plus WiFi 7. The two wired ports are bonded for aggregate LAN throughput and link redundancy; WiFi stays a separate failover path.
+The box has two Intel I226-V 2.5GbE ports plus WiFi 7. The two wired ports are bonded for aggregate LAN throughput and link redundancy; WiFi was intended as a separate failover path.
+
+> **What is actually happening (2026-09-26):** the roles are reversed. `bond0` holds an address and both slaves link at 2500 Mbps, but it has no route in any table and has transmitted zero bytes. All egress leaves over WiFi 7 MLO, which measures as the bond's equal (2.32 vs 2.36 Gbit/s to the same client). Inbound still arrives over ethernet, which is what `rp_filter=2` exists for. This is accepted rather than fixed; the detail and the measurements are in [finding 17](docs/TUNING-FINDINGS.md#17-the-25gbe-bond-carries-no-outbound-traffic-wifi-7-mlo-is-the-real-path-2026-09-26). Everything below describes the bond's intended design.
 
 **This box uses `balance-xor` (static LAG).** The upstream switch is a Grandstream GWN7721 (Lite-managed), which supports **static** link aggregation only - no LACP / 802.3ad. So the bond runs `mode: balance-xor` to match a static trunk: both ports active, TX spread across them by the hash policy. The bond mode must match the switch LAG type (static <-> `balance-xor`, LACP <-> `802.3ad`) or the link flaps. If your switch *does* support 802.3ad, use `mode: 802.3ad` + `lacp-rate: fast` instead (cleaner, switch-negotiated, detects miswiring).
 
@@ -523,6 +525,7 @@ so this file stays a reference for the box rather than a lab notebook. It covers
 | [14](docs/TUNING-FINDINGS.md#14-drift-check-corrected-2026-09-13) | Drift check corrected: it was comparing against kernel.org instead of the CachyOS PKGBUILD the build actually consumes                          |
 | [15](docs/TUNING-FINDINGS.md#15-drift-check-now-clears-the-drift-and-the-ci-got-its-own-ci-2026-09-17) | Drift check now dispatches the build that clears the drift, guarded against recursion; workflows hardened and given their own lint/security CI |
 | [16](docs/TUNING-FINDINGS.md#16-three-way-benchmark-stock-vs-servermax-vs-ultimate-2026-09-26) | Three-way benchmark on the live box: the scx server slice and the TCP candidates all measured as NOISE and did not ship; the binding constraint is now measurement noise, not any kernel knob |
+| [17](docs/TUNING-FINDINGS.md#17-the-25gbe-bond-carries-no-outbound-traffic-wifi-7-mlo-is-the-real-path-2026-09-26) | The 2.5GbE bond has no route and carries zero outbound traffic; egress is WiFi 7 MLO, which measures as its equal. Wireless-to-wireless testing understates the radio by over 3x |
 
 **Measuring a change before shipping it:** `scripts/nuc16pro-bench.sh` is the A/B harness that
 makes that rule satisfiable. It compares three runtime profiles (stock, servermax, and whatever
