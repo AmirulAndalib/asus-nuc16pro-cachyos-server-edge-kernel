@@ -1242,6 +1242,33 @@ for i in $(ls /sys/class/net 2>/dev/null | grep -E '^en'); do
   [ -n "$rxd" ] && [ "$rxd" -gt 1000 ] 2>/dev/null && flag "$i has $rxd rx drops"
 done
 
+# Which interface actually carries egress. A 2026-09-26 audit found the 2x2.5GbE bond holding
+# an address, both slaves linked at 2500 Mbps, and carrying literally zero outbound bytes:
+# every packet was leaving over WiFi because bond0 had no route in any table. Nothing in this
+# report would have shown that, and the repo meanwhile described the bond as the primary path.
+#
+# Reported, not flagged. Which link the operator wants as primary is their decision, and on
+# this deployment WiFi 7 MLO measures as the bond's equal. The only thing warned about is
+# having no default route at all, which is unambiguously broken.
+egress_dev="$(ip route show default 2>/dev/null | awk '/^default/{for(i=1;i<=NF;i++) if($i=="dev"){print $(i+1); exit}}')"
+if [ -n "$egress_dev" ]; then
+  note "egress interface: $egress_dev (carries the default route)"
+else
+  flag "no default route on this box - it cannot reach anything off-subnet"
+fi
+for i in bond0 wlo1; do
+  [ -e "/sys/class/net/$i" ] || continue
+  tx=$(cat "/sys/class/net/$i/statistics/tx_bytes" 2>/dev/null || echo 0)
+  rx=$(cat "/sys/class/net/$i/statistics/rx_bytes" 2>/dev/null || echo 0)
+  nroute=$(ip route show dev "$i" 2>/dev/null | grep -c . || true)
+  note "$i: tx=$((tx / 1073741824))GB rx=$((rx / 1073741824))GB routes=$nroute"
+  # An interface that is UP with an address but has no route is inert for outbound traffic.
+  # Worth surfacing precisely because it looks healthy in every other view.
+  if [ "$nroute" -eq 0 ] && ip -br addr show "$i" 2>/dev/null | grep -q '[0-9]\{1,3\}\.[0-9]\{1,3\}'; then
+    note "$i holds an address but has no route: it cannot originate outbound traffic"
+  fi
+done
+
 sec update-pipeline
 # The repo's whole promise is "always latest, never pinned", and that promise rests entirely
 # on the updater timer actually firing. Nothing surfaced when it stopped: a 2026-09-26 audit

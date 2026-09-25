@@ -549,7 +549,9 @@ bandwidth probing has nothing to discover. That is a known property of measuring
 zero-latency path, not a defect in the setting. BBR plus fq is chosen for the real 2.5GbE
 bond and the WAN upload path, neither of which this benchmark touches. The honest conclusion
 is that the loopback benchmark cannot answer the BBR question; a proper answer needs iperf3
-against a second host across the bond.
+against a second host. That test was then run and is recorded in section 17, which also
+corrects this sentence: the traffic did not cross the bond, because the bond carries no
+outbound traffic at all.
 
 **Disk 4k randread, stock +14.7%.** It clears its floor by 0.5 points, which is not a margin
 worth acting on, and the shape of the data argues against it: stock's spread is 300714 IOPS
@@ -572,3 +574,114 @@ identical profiles against each other and must report NOISE. It does.
 Every profile switch is reverted on exit, including on interrupt, and the restore is verified
 against scx attachment, mTHP orders, the IO scheduler, swappiness, congestion control and the
 zswap compressor. After this run the box was confirmed back on servermax on every one.
+
+---
+
+## 17. The 2.5GbE bond carries no outbound traffic; WiFi 7 MLO is the real path (2026-09-26)
+
+Chasing the BBR question from section 16 onto a real network turned up something much larger
+than the congestion-control answer.
+
+### What was found
+
+`ip route get <lan-peer>` resolves to `dev wlo1`. There is no bond0 route in the table at
+all: `ip route show dev bond0` returns nothing, and the only LAN route is
+`<lan-subnet> dev wlo1 ... metric 600`. bond0 holds an address but has nowhere to send.
+
+Interface counters since boot make it unambiguous:
+
+| interface | rx | tx |
+| --------- | -- | -- |
+| wlo1 | 21 GB | **467 GB** |
+| bond0 | 7 GB | **0 GB** |
+| enp86s0 | 3 GB | 0 GB |
+| enp87s0 | 3 GB | 0 GB |
+
+Measured directly: an iperf3 transfer of 3053 MB moved 3053 MB on wlo1 and exactly 0 on
+bond0 and both of its slaves.
+
+Inbound still arrives over ethernet (bond0 rx is 7 GB) because the switch ARPs for the bond's
+address and the link answers. Outbound leaves over WiFi. That asymmetry is precisely why
+`rp_filter=2` (loose) is required in `sysctl.d/99-nuc16pro-servermax.conf`; strict reverse-path
+filtering would drop these packets.
+
+### The link the traffic actually uses
+
+The AP is a WiFi 7 unit sitting immediately beside the box, and the association is nothing
+like the 80MHz WiFi 6 link recorded in section 11:
+
+```
+Link 0  2462 MHz      Link 1  5805 MHz      Link 2  7055 MHz     (Multi-Link Operation)
+tx bitrate: 5187.1 MBit/s   320MHz   EHT-MCS 12   EHT-NSS 2
+signal: -12 dBm
+```
+
+Three simultaneous bands at 5187 Mbit/s of PHY rate, at a signal level that means the radio is
+effectively touching the AP. Section 11's entry saying WiFi is "not at ceiling, but the limit
+is the AP (WiFi 6, no 6GHz/320MHz)" is obsolete: the AP was replaced and that limit is gone.
+
+### Which path is faster: measured three ways, and the answer is "the client decides"
+
+The obvious next question is whether WiFi is beating the bond. The first attempt to answer it
+was wrong, and the corrected answer is more interesting than either.
+
+The test client reaches the network through a 2.5GbE switch, so any measurement between these
+two machines is capped by that segment rather than by the link under test. Three paths were
+measured with 4 streams for 8 seconds each:
+
+| path | throughput | retransmits |
+| ---- | ---------- | ----------- |
+| NUC wlo1 (WiFi 7 MLO) to client on ethernet | 2.32 Gbit/s | 0 |
+| NUC bond0 forced with `--bind-dev`, client on ethernet | 2.36 Gbit/s | 24925 |
+| NUC wlo1 to the same client on its own WiFi 7 radio | 0.658 Gbit/s | 1 |
+
+Three things fall out of this.
+
+**Wired and wireless are indistinguishable to this client.** 2.32 against 2.36 Gbit/s is a 2%
+gap with both sitting at roughly 92% of a 2.5GbE segment. Neither link is the bottleneck. An
+earlier draft of this section claimed WiFi was "the faster path" on the strength of a single
+2.29 Gbit/s figure; that number was the ceiling of the client's switch hop, not of the radio,
+and the bond matches it when asked. Separating them needs a client that is not behind a 2.5GbE
+hop, which this deployment does not have.
+
+**Wireless to wireless is the configuration to avoid.** Moving the client onto its own WiFi 7
+radio collapsed throughput to 658 Mbit/s, roughly 28% of the wired-client result, because both
+stations then contend for the same airtime and the AP has to receive every frame before
+re-transmitting it. This matters for how the box is measured in future: benchmarking the NUC's
+WiFi against a wireless peer understates it by more than 3x. Test against a wired peer.
+
+**The bond's retransmit count is the real signal in that table.** 24925 retransmits against
+zero on WiFi, for a 2% throughput gain. That is not evidence the bond is unhealthy on its own
+merits: forcing traffic out bond0 with `SO_BINDTODEVICE` while the return path still arrives
+over WiFi creates exactly the asymmetry that provokes it. It does say that bond0 cannot simply
+be forced into service one socket at a time, and that any future move back to wired has to fix
+the routing properly rather than pin individual applications to the interface.
+
+What this does establish is that **bond0 is fully functional hardware**: bound explicitly it
+moves 2.36 Gbit/s, both slaves link at 2500 Mbps full duplex, and it is not a dead link. It
+simply has no route.
+
+### Status: accepted, not fixed
+
+This is recorded as the operator's deliberate position rather than a defect to repair. WiFi 7
+MLO is at least the equal of the wired bond on every measurement available here, the AP is
+adjacent to the box, and the traffic is not being slowed by using it.
+
+Nothing was changed on the box. Re-pointing the default route at bond0 is exactly the
+operation that has dropped SSH on this machine before and needs console access to recover, so
+it is not something to attempt remotely for a path that is currently slower anyway.
+
+What this does change is the documentation. The repo described a 2x2.5GbE bond as the primary
+path with WiFi as failover. The truth is the reverse, and several things tuned for the bond
+are inert while that remains true:
+
+- the igc ring buffer sizing (rx=4096 tx=4096) applies to interfaces carrying zero outbound bytes
+- the balance-xor / layer3+4 hash policy is not distributing anything
+- `bond0` rx drops and errors are still worth watching, because inbound does use it
+
+### Honest correction to section 16
+
+Section 16 proposed testing BBR "against a second host across the bond". That test was run and
+BBR held up, but it crossed WiFi, not the bond, because the bond cannot send. The result
+stands as a real-network measurement, but it crossed WiFi: the word "bond" in that sentence
+was wrong.
