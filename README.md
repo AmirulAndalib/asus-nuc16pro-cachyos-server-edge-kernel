@@ -522,6 +522,19 @@ so this file stays a reference for the box rather than a lab notebook. It covers
 | [13](docs/TUNING-FINDINGS.md#13-routine-checkup-2026-09-01)       | Routine checkup: why Vulkan stays on lavapipe, and why`scxctl get` reporting "its own defaults" is healthy                                    |
 | [14](docs/TUNING-FINDINGS.md#14-drift-check-corrected-2026-09-13) | Drift check corrected: it was comparing against kernel.org instead of the CachyOS PKGBUILD the build actually consumes                          |
 | [15](docs/TUNING-FINDINGS.md#15-drift-check-now-clears-the-drift-and-the-ci-got-its-own-ci-2026-09-17) | Drift check now dispatches the build that clears the drift, guarded against recursion; workflows hardened and given their own lint/security CI |
+| [16](docs/TUNING-FINDINGS.md#16-three-way-benchmark-stock-vs-servermax-vs-ultimate-2026-09-26) | Three-way benchmark on the live box: the scx server slice and the TCP candidates all measured as NOISE and did not ship; the binding constraint is now measurement noise, not any kernel knob |
+
+**Measuring a change before shipping it:** `scripts/nuc16pro-bench.sh` is the A/B harness that
+makes that rule satisfiable. It compares three runtime profiles (stock, servermax, and whatever
+candidate is under test) on the live box, rotates profile order each round to cancel position
+bias, treats the within-profile spread as the noise floor, and always restores servermax on
+exit. Run `nuc16pro-bench.sh selftest` first: it benchmarks two identical profiles and must
+report NOISE, which is the only evidence its verdicts mean anything.
+
+**Checking the repo itself:** `scripts/repo-audit.sh` runs ten mechanical checks (shell and YAML
+syntax, the shell inside every workflow `run:` block, updater-vs-sources sync, splice markers,
+host-specific data, em dashes, action SHA pinning, `workflow_run` targets, and markdown
+links/anchors). It runs in CI as part of `lint-ci.yml`.
 
 The short version of the rule those sections establish: **a tuning change stays only if it has
 a number behind it.** Four changes once shipped on mechanism alone; two of them were then

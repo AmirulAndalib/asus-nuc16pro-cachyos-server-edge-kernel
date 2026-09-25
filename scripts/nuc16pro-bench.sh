@@ -153,7 +153,10 @@ verify_servermax() {
   [ "$sch" = adios ] || { echo "   nvme0n1 sched is '$sch' not adios"; ok=1; }
   [ "$(sysctl -n vm.swappiness 2>/dev/null)" = 10 ] || { echo "   swappiness not 10"; ok=1; }
   [ "$(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null)" = bbr ] || { echo "   cc not bbr"; ok=1; }
-  zc=$(sed -n 's/.*\[\([a-z0-9]*\)\].*//p' /sys/module/zswap/parameters/compressor 2>/dev/null || cat /sys/module/zswap/parameters/compressor 2>/dev/null)
+  # /sys/module/zswap/parameters/compressor holds a bare value with NO brackets, unlike
+  # the sysfs files above it. A bracket-extracting sed returns empty here and made this
+  # verify report a false failure while the box was in fact correctly restored.
+  zc=$(tr -d "[:space:]" < /sys/module/zswap/parameters/compressor 2>/dev/null)
   case "$zc" in *zstd*) ;; *) echo "   zswap compressor is '$zc' not zstd"; ok=1 ;; esac
   [ $ok -eq 0 ] && echo "   verified: servermax profile restored"
   return $ok

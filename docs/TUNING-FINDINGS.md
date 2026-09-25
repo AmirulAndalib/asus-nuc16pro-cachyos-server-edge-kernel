@@ -483,3 +483,92 @@ inputs and several conditional steps, which is not obviously simpler than two re
 and it is a refactor with a six-hour feedback loop on a pipeline that currently works. Doing it
 in the same change as the drift plumbing would also have given any breakage two candidate
 causes.
+
+---
+
+## 16. Three-way benchmark: stock vs servermax vs ultimate (2026-09-26)
+
+Section 12 set the rule that a tuning change needs a number behind it, but the box had no way
+to produce one. `scripts/nuc16pro-bench.sh` is that missing capability, and this is its first
+real result: an interleaved, order-rotated comparison of three runtime profiles on the live
+box while it served its normal ~91 containers.
+
+**Scope, stated plainly.** All three profiles run on the SAME kernel. This measures the
+runtime tuning layer only. It cannot A/B the kernel build itself (ThinLTO, x86-64-v3, HZ=100,
+preempt=lazy, ADIOS compiled in), because that needs a reboot into a different kernel image,
+and only the CachyOS kernel is installed. "stock" below means this kernel with the tuning
+removed, not the stock Ubuntu kernel.
+
+| profile | what it is |
+| ------- | ---------- |
+| stock | EEVDF (scx detached), PMD-only THP, mq-deadline + nr_requests 64, distro sysctls (swappiness 60, cubic, pfifo_fast) |
+| servermax | what this repo ships: scx_flash, mTHP 16k/32k/64k, ADIOS + nr_requests 1023, bbr + fq, swappiness 10 |
+| ultimate | servermax plus the candidates under test: `scx_flash --slice-us 3000`, `tcp_slow_start_after_idle=0`, `tcp_notsent_lowat=128k` |
+
+### Results
+
+5 rounds per benchmark, 12s per run, profile order rotated every round. Medians shown;
+"noise floor" is the larger of the two within-profile spreads, expressed as a percentage.
+
+| benchmark | stock vs servermax | ultimate vs servermax | noise floor | verdict on ultimate |
+| --------- | ------------------ | --------------------- | ----------- | ------------------- |
+| cpu throughput | -0.7% | -0.4% | 28.3% | NOISE |
+| context switch | -16.8% | -9.4% | 33.0% | NOISE |
+| fork/exec churn | -14.0% | +3.2% | 18.3% | NOISE |
+| disk 4k randread | +14.7% | +1.4% | 14.2% | NOISE |
+| loopback TCP | +48.7% | -0.5% | 9.1% | NOISE |
+
+### What this settles
+
+**The ultimate profile does not ship.** Not one of its three candidates cleared the noise
+floor on any benchmark. The `scx_flash` server slice was the single biggest unexploited lever
+in this repo: `config.toml` sets `default_mode = "Server"` but defines no `server_mode` flag
+array, so flash has always run upstream defaults, and section 10 explicitly left it alone for
+want of a measurement. It now has one, and the answer is that a 3000us slice buys nothing
+here. The `[scheds.flash] server_mode` array stays absent, and that is now a measured
+decision rather than an open question.
+
+**The binding constraint is no longer any kernel knob: it is measurement noise.** The
+within-profile spread on this box ranges from 9% (loopback) to 33% (context switch) while it
+serves live traffic. Any tuning change worth less than roughly a third of a context-switch
+benchmark is unprovable here without quiescing the machine, and quiescing it means taking down
+DNS, Plex and Home Assistant. That is the real ceiling, and it retroactively justifies the
+section 10 decision to withdraw the wbt/rq_affinity change on a sub-5% fio delta.
+
+**scx_flash earns its place on scheduler-shaped work.** servermax beats stock by 16.8% on
+context switching and 14.0% on fork/exec churn. Both sit under the noise floor so neither is
+proof, but the direction is consistent and it is the workload shape this box actually has:
+~91 containers, not one hot loop. Nothing here argues for going back to EEVDF.
+
+### Two results that look like wins and are not
+
+**Loopback TCP, stock +48.7%.** This one clears its noise floor, and it is still not a reason
+to change anything. stock uses cubic with pfifo_fast; servermax uses BBR with fq. On loopback
+there is no bottleneck link and no real RTT, so fq's pacing is pure overhead and BBR's
+bandwidth probing has nothing to discover. That is a known property of measuring BBR on a
+zero-latency path, not a defect in the setting. BBR plus fq is chosen for the real 2.5GbE
+bond and the WAN upload path, neither of which this benchmark touches. The honest conclusion
+is that the loopback benchmark cannot answer the BBR question; a proper answer needs iperf3
+against a second host across the bond.
+
+**Disk 4k randread, stock +14.7%.** It clears its floor by 0.5 points, which is not a margin
+worth acting on, and the shape of the data argues against it: stock's spread is 300714 IOPS
+(31% of its own median) while servermax's is 32905 (3.4%). ADIOS is dramatically more
+consistent; mq-deadline occasionally spikes higher. A single 4k randread pattern is also a
+poor proxy for ~91 containers doing mixed IO through LUKS. Not actionable as it stands.
+
+### Method notes worth keeping
+
+The first run of this harness used a fixed profile order and produced a clean-looking and
+completely false result: stock flat near 39000 while servermax climbed 36139 to 38747 across
+rounds, which read as "stock wins CPU by 8%". It was position bias. Whichever profile ran
+first each round benchmarked on a machine that had just finished settling, and the later ones
+paid for a scheduler restart. Rotating the order per round removed the effect entirely and the
+same comparison came back as -0.7%, which is to say nothing at all.
+
+The harness proves itself before it is trusted: `nuc16pro-bench.sh selftest` runs two
+identical profiles against each other and must report NOISE. It does.
+
+Every profile switch is reverted on exit, including on interrupt, and the restore is verified
+against scx attachment, mTHP orders, the IO scheduler, swappiness, congestion control and the
+zswap compressor. After this run the box was confirmed back on servermax on every one.
