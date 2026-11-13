@@ -5,10 +5,14 @@ OWNER_REPO="${OWNER_REPO:-AmirulAndalib/asus-nuc16pro-cachyos-server-edge-kernel
 
 STATE_DIR="/var/lib/nuc16pro-kernel-updater"
 LOG_DIR="/var/log/nuc16pro-kernel-updater"
-WORK_DIR="/tmp/nuc16pro-kernel-install"
+# Root-owned, and deliberately not under /tmp. This script runs as root, writes fixed file
+# names here and then installs what it downloaded; with a world-writable parent any local user
+# could pre-create the directory and swap a package between the checksum and dpkg.
+WORK_DIR="/var/cache/nuc16pro-kernel-updater"
 LOCK_FILE="/run/nuc16pro-kernel-updater.lock"
 
-mkdir -p "$STATE_DIR" "$LOG_DIR" "$WORK_DIR"
+mkdir -p "$STATE_DIR" "$LOG_DIR"
+install -d -m 0700 -o root -g root "$WORK_DIR"
 
 exec 9>"$LOCK_FILE"
 if ! flock -n 9; then
@@ -20,6 +24,30 @@ LOG="$LOG_DIR/install-$(date +%Y%m%d-%H%M%S).log"
 exec > >(tee -a "$LOG") 2>&1
 
 msg() { echo ":: $*"; }
+
+# Every network read goes through here: bounded, retried, and loud on failure. A bare curl has
+# no timeout, and this runs from a oneshot unit with no start timeout, so one stalled
+# connection would hold the lock and quietly stop every later timer run.
+fetch() { curl -fsSL --retry 3 --retry-delay 5 --connect-timeout 20 --max-time 1800 "$@"; }
+
+# Each run leaves one log and one grub backup behind. Keep the newest of each: the box had
+# 164 logs and 158 backup directories after five months with nothing pruning them.
+prune_keep_newest() {
+  local dir="$1" keep="$2"
+  [ -d "$dir" ] || return 0
+  find "$dir" -mindepth 1 -maxdepth 1 -printf '%T@ %p\0' | sort -zrn | tail -zn +"$((keep + 1))" |
+    cut -zd' ' -f2- | xargs -0r rm -rf --
+}
+
+# What the initramfs and grub.cfg are built from, as far as this script can change it: the
+# files it edits, plus the set of installed kernels.
+boot_inputs_fingerprint() {
+  {
+    cat /etc/default/grub /etc/crypttab /etc/initramfs-tools/modules \
+        /etc/modprobe.d/xe-nuc16pro.conf /etc/modprobe.d/nuc16pro-wifi.conf 2>/dev/null || true
+    find /boot -maxdepth 1 -name 'vmlinuz-*' | sort
+  } | sha256sum | cut -d' ' -f1
+}
 
 # Keep newest installed cachyos-nuc16pro kernel + currently running kernel.
 # Purge all other cachyos-nuc16pro image and header packages.
@@ -107,7 +135,9 @@ msg "fetching latest release"
 # scx-* release would then be misread as the kernel release (no linux-image
 # asset -> hard fail until the next kernel release lands, possibly weeks out).
 # Mirrors the scx fetch filter in install_scx_from_release.
-curl -fsSL "https://api.github.com/repos/${OWNER_REPO}/releases" | \
+# per_page=100: the default page is 30 releases, and the two streams publish at very different
+# rates, so the slower one can fall off a short first page and read as "no release found".
+fetch "https://api.github.com/repos/${OWNER_REPO}/releases?per_page=100" | \
   jq '[.[] | select(.tag_name | startswith("scx-") | not)] | .[0]' > "$WORK_DIR/latest-release.json"
 
 TAG="$(jq -r '.tag_name' "$WORK_DIR/latest-release.json")"
@@ -120,6 +150,65 @@ fi
 # upstream kernel version extracted from tag: v7.0.10-cachyos-... -> 7.0.10
 TAG_KVER="$(echo "$TAG" | sed 's/^v//; s/-cachyos.*//')"
 echo "latest release: $TAG ($TAG_KVER)"
+
+# Self-update. The box runs a local copy of this script from a timer, so a fix pushed to the
+# repo never used to reach it: someone had to copy the new script over by hand, and until they
+# did, every 04:00 run re-applied whatever the stale copy embedded. Each kernel release now
+# carries the updater that was on master when it was built, plus its sha256, and a release
+# this box has not seen before replaces the local copy when the two differ.
+#
+# This grants no new authority: whoever can publish a release here can already ship the .debs
+# this script installs as root. The new copy is checksum-verified and syntax-checked, swapped
+# in with a rename (the running script keeps its old inode) and first runs at the next start.
+# The previous copy stays beside it as .prev.
+#
+# Only an unseen release triggers it, so a copy deployed by hand for testing survives until
+# the next kernel release, and the first run after a manual install just records the current
+# tag. NUC16PRO_SELF_UPDATE=0 turns it off.
+self_update() {
+  local self="/usr/local/sbin/nuc16pro-kernel-updater.sh"
+  local seen="$STATE_DIR/updater-release-tag"
+  local name="nuc16pro-kernel-updater.sh"
+  local url sum_url want new="$WORK_DIR/nuc16pro-kernel-updater.sh.new"
+
+  [ "${NUC16PRO_SELF_UPDATE:-1}" = 1 ] || return 0
+  [ -f "$self" ] || return 0
+  if [ ! -f "$seen" ]; then
+    echo "$TAG" > "$seen"
+    return 0
+  fi
+  [ "$(cat "$seen")" != "$TAG" ] || return 0
+
+  url="$(jq -r --arg n "$name" '.assets[] | select(.name == $n) | .browser_download_url' "$WORK_DIR/latest-release.json")"
+  sum_url="$(jq -r --arg n "$name.sha256" '.assets[] | select(.name == $n) | .browser_download_url' "$WORK_DIR/latest-release.json")"
+  if [ -z "$url" ] || [ -z "$sum_url" ]; then
+    echo "self-update: $TAG carries no updater asset, keeping the installed copy"
+    echo "$TAG" > "$seen"
+    return 0
+  fi
+
+  fetch -o "$new" "$url" || return 1
+  want="$(fetch "$sum_url" | awk '{print $1; exit}')" || return 1
+  if [ -z "$want" ] || [ "$(sha256sum "$new" | cut -d' ' -f1)" != "$want" ]; then
+    echo "warn: self-update: checksum mismatch for $name in $TAG"
+    return 1
+  fi
+  if ! bash -n "$new"; then
+    echo "warn: self-update: $name from $TAG does not parse"
+    return 1
+  fi
+
+  echo "$TAG" > "$seen"
+  if cmp -s "$new" "$self"; then
+    echo "self-update: installed updater already matches $TAG"
+    return 0
+  fi
+  cp -p "$self" "$self.prev"
+  install -m 0700 "$new" "$self.tmp"
+  mv -f "$self.tmp" "$self"
+  echo "self-update: installed the updater from $TAG; it runs from the next start (previous copy: $self.prev)"
+}
+self_update || echo "warn: self-update did not complete, keeping the installed copy"
 
 LAST_TAG_FILE="$STATE_DIR/last-installed-tag"
 
@@ -168,7 +257,7 @@ if [ "$NEED_REBOOT_ONLY" -eq 0 ]; then
   while IFS= read -r url; do
     [ -z "$url" ] && continue
     echo "  -> $url"
-    curl -fLJO "$url"
+    fetch -JO "$url"
   done < "$WORK_DIR/urls.txt"
 
   ls -lh
@@ -211,6 +300,8 @@ msg "system tuning"
 BACKUP_DIR="$STATE_DIR/backups/$(date +%Y%m%d-%H%M%S)"
 mkdir -p "$BACKUP_DIR"
 cp -a /etc/default/grub "$BACKUP_DIR/grub.bak" 2>/dev/null || true
+prune_keep_newest "$STATE_DIR/backups" 30
+prune_keep_newest "$LOG_DIR" 60
 
 # Intel Xe3 LP (Panther Lake iGPU, device 0xB0A0): xe driver, no i915 options needed
 # xe driver auto-enables GuC firmware submission; no modprobe options required
@@ -253,17 +344,13 @@ vm.dirty_ratio                     = 20
 fs.file-max                        = 2097152
 net.core.netdev_max_backlog        = 16384
 
-# Dual NIC: loose reverse-path filter allows multi-homed WiFi+ETH simultaneously.
-# rp_filter=2 (loose) instead of 1 (strict) so both NICs can receive traffic
-# when routing via the other interface (e.g. default via eth, DNS via wifi).
-# NOT setting ip_forward: this is a workstation, not a router.
+# Multi-homed box (2.5GbE bond + WiFi on the same subnet): loose reverse-path filter.
+# With rp_filter=1 (strict) a packet arriving on the interface that does not hold the best
+# route back to its source is dropped, which is exactly what happens whenever one link
+# carries the default route and the peer answers ARP on the other.
+# ip_forward is not set here: Docker enables forwarding itself for its bridges.
 net.ipv4.conf.all.rp_filter        = 2
 net.ipv4.conf.default.rp_filter    = 2
-
-# NVMe: disable power-saving latency states for Gen4/Gen5 max throughput
-# (mirrors kernel cmdline nvme_core.default_ps_max_latency_us=0)
-# This is belt-and-suspenders; cmdline takes effect earlier at boot.
-# dev.nvme is not a sysctl namespace; NVMe PS is controlled via cmdline only.
 SYSCTL
 
 # I/O scheduler: ADIOS for SSDs/NVMe, BFQ for spinning disks
@@ -394,19 +481,19 @@ systemctl daemon-reload
 systemctl enable nuc16pro-servermax-power.service || true
 # restart, not just enable: RemainAfterExit=yes means an already-active oneshot
 # won't re-run ExecStart just because the unit file changed underneath it.
-# This is what actually pushes a wattage/Tau change live on a machine that's
-# already on the target kernel (no kernel change -> no reboot -> service never re-fires).
+# This is what pushes a changed device setting live on a machine that is already on the
+# target kernel (no kernel change -> no reboot -> the service would never re-fire).
 systemctl restart nuc16pro-servermax-power.service || true
 
-# Memory policy: multi-size THP mid orders, DAMON proactive reclaim, KSM asserted off.
-# Measured motivation (see the unit for the numbers): with only the 2MB PMD order enabled,
-# 81% of THP faults on this box fell back to 4K pages because a 30GB machine running ~70
-# containers is too fragmented to serve 2MB contiguous allocations. Enabling 16k/32k/64k
-# gave the fault path somewhere to land and produced ~700k successful huge-page allocations
-# in ~10 minutes, 64k succeeding 87.6% of the time.
+# Memory policy: multi-size THP mid orders on, zswap shrinker off, KSM and DAMON reclaim
+# asserted off. Measured motivation (see the unit for the numbers): with only the 2MB PMD
+# order enabled, 81% of THP faults on this box fell back to 4K pages because a 30GB machine
+# running ~70 containers is too fragmented to serve 2MB contiguous allocations. Enabling
+# 16k/32k/64k gave the fault path somewhere to land and produced ~700k successful huge-page
+# allocations in ~10 minutes, 64k succeeding 87.6% of the time.
 install -Dm644 /dev/stdin /etc/systemd/system/nuc16pro-servermax-mm.service <<'MM_SVC'
 [Unit]
-Description=NUC 16 Pro ServerMax memory tuning (multi-size THP orders + DAMON proactive reclaim)
+Description=NUC 16 Pro ServerMax memory tuning (multi-size THP orders on, zswap shrinker off, KSM and DAMON reclaim off)
 # Ordered like the scx_loader drop-in, NOT After=multi-user.target. The mm policy has to be
 # in place before dockerd forks the container fleet, otherwise ~70 containers fault in their
 # anonymous memory under the old policy and only inherit the new one for later allocations.
@@ -446,6 +533,21 @@ ExecStart=/bin/sh -c 'for o in 16 32 64; do e=/sys/kernel/mm/transparent_hugepag
 # Let the kernel reclaim THPs that are mostly zero-filled instead of pinning the memory.
 # Matters more once the mid orders are live, since there are simply more THPs around.
 ExecStart=/bin/sh -c '[ -w /sys/kernel/mm/transparent_hugepage/shrink_underused ] && echo 1 > /sys/kernel/mm/transparent_hugepage/shrink_underused || true'
+
+# --- zswap shrinker: OFF, measured -------------------------------------------------------
+# The shrinker writes compressed pages back to the swap device under memory pressure. That
+# suits a machine whose pressure comes and goes. This one is under permanent page-cache
+# pressure (a torrent client reading hundreds of GB a day), so the shrinker never stopped.
+# Counters after 11.6h of uptime, 2026-11-13:
+#   zswpwb 5372462 == pswpout 5372462   every disk swap-out on the box was zswap writeback
+#   pool_limit_hit 0, pool 484MB        1.5% of RAM in use against a 30% ceiling
+#   pswpin 4032292                      75% of what it wrote out was faulted back from disk
+# That is 20GB written to and 15GB read back from the LUKS NVMe for pages zswap had room to
+# keep compressed in RAM at roughly 4:1. With the shrinker off, writeback over the next 240s
+# was exactly 0 pages, against 5257 in the 120s before. zswap still evicts by LRU if the
+# pool ever reaches max_pool_percent, so this removes the early eviction, not the limit.
+# Also on the kernel command line; asserted here so it applies without a reboot.
+ExecStart=/bin/sh -c '[ -w /sys/module/zswap/parameters/shrinker_enabled ] && echo N > /sys/module/zswap/parameters/shrinker_enabled || true'
 
 # --- KSM: deliberately OFF ---------------------------------------------------------------
 # Tested on this box, not assumed. KSM was enabled with advisor_mode=scan-time and left to
@@ -542,29 +644,34 @@ fi
 if [ -d /etc/docker ] && command -v python3 >/dev/null 2>&1; then
   cp -n /etc/docker/daemon.json /etc/docker/daemon.json.nuc16pro-servermax.bak 2>/dev/null || true
   python3 - <<'DOCKER_JSON' || echo "docker: daemon.json untouched (parse failure, left as-is)"
-import json, os
+import json, os, tempfile
 p = "/etc/docker/daemon.json"
 try:
-    d = json.load(open(p)) if os.path.exists(p) and os.path.getsize(p) else {}
+    old = json.load(open(p)) if os.path.exists(p) and os.path.getsize(p) else {}
 except Exception:
     raise SystemExit(1)
-if not isinstance(d, dict):
+if not isinstance(old, dict):
     raise SystemExit(1)
-d.setdefault("log-driver", "json-file")
-opts = d.get("log-opts") if isinstance(d.get("log-opts"), dict) else {}
+new = json.loads(json.dumps(old))
+new.setdefault("log-driver", "json-file")
+opts = new.get("log-opts") if isinstance(new.get("log-opts"), dict) else {}
 opts.update({"max-size": "50m", "max-file": "3", "compress": "true"})
-d["log-opts"] = opts
-d.setdefault("live-restore", True)
-json.dump(d, open(p, "w"), indent=2)
+new["log-opts"] = opts
+new.setdefault("live-restore", True)
+# Written only when something changed, and through a rename: dockerd reads this file at
+# start, so a write cut short by a crash must not be able to leave half a JSON document.
+if new != old:
+    fd, tmp = tempfile.mkstemp(dir=os.path.dirname(p), prefix=".daemon.json.")
+    with os.fdopen(fd, "w") as f:
+        json.dump(new, f, indent=2)
+        f.write("\n")
+        f.flush()
+        os.fsync(f.fileno())
+    os.chmod(tmp, 0o644)
+    os.replace(tmp, p)
 DOCKER_JSON
 fi
 
-# bluetoothd on a headless server: it finds nearby devices it can never pair and logs a
-# failure for each one. Measured on this box: 9436 of 10182 journal error lines in a single
-# boot, 93% of the entire error log, which buries anything that actually matters and writes
-# journal to the encrypted root for no reason. No BT peripherals are used on a rack box.
-# Guarded so it is a no-op where bluetooth is not installed, and trivially reversible with
-# `systemctl enable --now bluetooth`.
 # Headless-server plymouth deadlock: plymouth-quit-wait.service runs `plymouth --wait` with
 # TimeoutStartUSec=infinity and is ordered Before=multi-user.target. On a server with no
 # graphical/display-manager handoff plymouthd never quits, so the unit blocks forever and
@@ -602,7 +709,7 @@ install_scx_from_release() {
 
   # Same repo as the kernel releases; filter to the scx-* tag stream since
   # /releases/latest would resolve to whichever stream published most recently.
-  curl -fsSL "https://api.github.com/repos/${OWNER_REPO}/releases" | \
+  fetch "https://api.github.com/repos/${OWNER_REPO}/releases?per_page=100" | \
     jq '[.[] | select(.tag_name | startswith("scx-"))] | .[0]' > "$scx_json"
 
   local scx_tag
@@ -633,7 +740,7 @@ install_scx_from_release() {
     while IFS= read -r url; do
       [ -z "$url" ] && continue
       echo "  -> $url"
-      curl -fLJO "$url"
+      fetch -JO "$url"
     done < urls.txt
 
     ls -lh
@@ -861,8 +968,14 @@ if [ "$NEED_REBOOT_ONLY" -eq 2 ]; then
   # not just when nothing is running at all.
   if [ "$SCX_ACTIVE" -eq 0 ] || [ "$SCX_UPDATED" -eq 1 ]; then
     echo "SCX not active or just updated, (re)starting..."
-    systemctl restart nuc16pro-scx-server.service 2>/dev/null || \
-      systemctl restart scx_loader.service 2>/dev/null || true
+    # Restart the unit that owns sched_ext. This used to try the direct unit first, which is
+    # disabled once scx_loader has taken over. That restart "succeeded" by starting a second,
+    # redundant launcher, so the fallback never ran and scx_loader kept the old binary loaded.
+    if systemctl is-enabled --quiet scx_loader.service 2>/dev/null; then
+      systemctl restart scx_loader.service || true
+    else
+      systemctl restart nuc16pro-scx-server.service || true
+    fi
   else
     echo "SCX active, no update"
   fi
@@ -896,6 +1009,16 @@ case "$(uname -r)" in
   *) flag "not running the custom servermax kernel" ;;
 esac
 note "uptime:$(uptime -p 2>/dev/null | sed 's/^up//' || true)"
+# Both reported, neither flagged. The kdump reservation is RAM the box cannot use, which is
+# worth seeing on a machine whose tightest resource is memory, but keeping crash dumps on a
+# remotely administered server is an operator decision.
+ck=$(cat /sys/kernel/kexec_crash_size 2>/dev/null || echo 0)
+if [ "${ck:-0}" -gt 0 ] 2>/dev/null; then
+  note "crashkernel reservation: $((ck / 1048576))MB held for kdump (crash kernel loaded: $(cat /sys/kernel/kexec_crash_loaded 2>/dev/null))"
+fi
+if [ -f /run/reboot-required ]; then
+  note "reboot required by: $(sort -u /run/reboot-required.pkgs 2>/dev/null | tr '\n' ' ')"
+fi
 
 sec systemd
 failed=$(systemctl --failed --no-legend --plain 2>/dev/null | awk '{print $1}')
@@ -915,10 +1038,14 @@ if [ "$state" = enabled ] && [ -n "$ops" ]; then
 else
   flag "no scx scheduler attached (kernel EEVDF is active)"
 fi
-nr=$(systemctl show nuc16pro-scx-server.service -p NRestarts --value 2>/dev/null || echo '?')
-note "scx unit restarts this boot: $nr"
+# Ask the unit that actually owns sched_ext: scx_loader once it has taken over, the direct
+# unit otherwise. The direct unit is disabled under scx_loader and always answers 0.
+scxu=nuc16pro-scx-server.service
+systemctl is-active --quiet scx_loader.service 2>/dev/null && scxu=scx_loader.service
+nr=$(systemctl show "$scxu" -p NRestarts --value 2>/dev/null || echo '?')
+note "$scxu restarts this boot: $nr"
 cg=$(journalctl -b -k 2>/dev/null | grep -ciE 'cgroup_init\(\) failed')
-note "cgroup_init ENOMEM events this boot: $cg (boot-storm transient; absorbed by try_primary retry)"
+note "cgroup_init ENOMEM events this boot: $cg (early-boot transient; the scheduler is relaunched until it attaches)"
 
 sec gpu-xe
 [ -d /sys/bus/pci/drivers/xe ] && note "xe driver bound: yes" || flag "xe driver not bound"
@@ -1074,8 +1201,21 @@ fi
 if [ -f /sys/module/zswap/parameters/max_pool_percent ]; then
   note "zswap pool: $(cat /sys/module/zswap/parameters/max_pool_percent)% compressor=$(cat /sys/module/zswap/parameters/compressor 2>/dev/null)"
 fi
-zo=$(awk '/^zswpout/{o=$2} /^zswpin/{i=$2} END{if (o>0) printf "%d", i*100/o; else printf "0"}' /proc/vmstat)
-note "zswap refault ratio: ${zo}% of writeouts were read back (high = pool under-sized for the working set)"
+# zswap, by the counters that separate "working" from "leaking to disk". zswpin against
+# zswpout only says compressed pages get reused from RAM, which is zswap doing its job. The
+# numbers that cost something are zswpwb (compressed pages evicted to the swap device) and
+# pswpin (pages read back from that device). With the shrinker on, this box wrote 20GB to
+# disk in 11.6h while the pool sat at 1.5% of RAM, so the shrinker is asserted off and
+# flagged if it comes back.
+if [ -f /sys/module/zswap/parameters/shrinker_enabled ]; then
+  zs=$(cat /sys/module/zswap/parameters/shrinker_enabled)
+  zwb=$(awk '/^zswpwb /{print $2}' /proc/vmstat)
+  dsi=$(awk '/^pswpin /{print $2}' /proc/vmstat)
+  zpool=$(awk '/^Zswap:/{print int($2 / 1024)}' /proc/meminfo)
+  zheld=$(awk '/^Zswapped:/{print int($2 / 1024)}' /proc/meminfo)
+  note "zswap: ${zheld:-0}MB held in a ${zpool:-0}MB pool; shrinker=$zs; since boot ${zwb:-0} pages written back to disk, ${dsi:-0} swapped in from disk"
+  [ "$zs" = N ] || flag "zswap shrinker is on - it evicts to disk long before the pool is full on this box (nuc16pro-servermax-mm.service not applied?)"
+fi
 
 sec block-perf
 for d in /sys/block/nvme[0-9]n[0-9] /sys/block/sd[a-z]; do
@@ -1178,12 +1318,6 @@ fi
 mem_avail=$(awk '/^MemAvailable:/{printf "%d", $2/1024}' /proc/meminfo 2>/dev/null)
 mem_total=$(awk '/^MemTotal:/{printf "%d", $2/1024}' /proc/meminfo 2>/dev/null)
 [ -n "$mem_avail" ] && note "memory available: ${mem_avail}MB of ${mem_total}MB (MemFree alone is misleading here: most of RAM is page cache)"
-# zswap refault: how much of what was compressed out had to be pulled straight back. High is a
-# sign the pool is under-sized for the working set, which is a capacity fact, not a bug.
-if [ -r /proc/vmstat ]; then
-  zrf=$(awk '/^zswpout /{o=$2} /^zswpin /{i=$2} END{ if(o>0) printf "%d", 100*i/o }' /proc/vmstat 2>/dev/null)
-  [ -n "$zrf" ] && note "zswap refault: ${zrf}% of writeouts were read back"
-fi
 # conntrack: ~90 containers plus a torrent client is the workload most likely to exhaust this
 # table, and a full table silently drops new connections. Audited at 4426/262144 (2%), so this
 # is headroom reporting, not a known problem.
@@ -1204,7 +1338,7 @@ sec device-health
 # unsafe_shutdowns is deliberately NOT flagged: the Micron 2200 in this box reports a
 # spuriously high count (a known firmware quirk), so warning on it would be crying wolf.
 if command -v nvme >/dev/null 2>&1 && [ "$(id -u)" -eq 0 ]; then
-  for dev in /dev/nvme0n1 /dev/nvme1n1; do
+  for dev in /dev/nvme[0-9]n[0-9]; do
     [ -e "$dev" ] || continue
     log=$(nvme smart-log "$dev" 2>/dev/null) || continue
     model=$(cat "/sys/block/$(basename "$dev")/device/model" 2>/dev/null | tr -s ' ')
@@ -1325,7 +1459,7 @@ HEALTHCHECK
 install -Dm644 /dev/stdin /etc/systemd/system/nuc16pro-healthcheck.service <<'HC_SVC'
 [Unit]
 Description=NUC 16 Pro ServerMax post-boot health report (read-only; logs to journal)
-After=multi-user.target docker.service nuc16pro-scx-server.service
+After=multi-user.target docker.service scx_loader.service nuc16pro-scx-server.service
 ConditionPathExists=/usr/local/sbin/nuc16pro-healthcheck
 
 [Service]
@@ -1429,9 +1563,9 @@ done
 #   'lazy' as preempt modes; 'none'/'voluntary' are NOT built, so an earlier preempt=none
 #   was rejected and the kernel ran 'full'. preempt=lazy IS honored (verified at cold
 #   boot) and is the throughput-lean server pick: fair-class tasks run fuller slices
-#   while RT-class threaded IRQs still preempt immediately (low latency). scx_bpfland
-#   --server is the real scheduler and dominates regardless. Runtime-switchable via
-#   /sys/kernel/debug/sched/preempt.
+#   while RT-class threaded IRQs still preempt immediately (low latency). The sched_ext
+#   scheduler (scx_flash) makes the real placement decisions regardless. Runtime-switchable
+#   via /sys/kernel/debug/sched/preempt.
 # mitigations=auto: keep CPU vulnerability mitigations on (box is internet-exposed).
 # No i915.enable_guc=3: Panther Lake iGPU uses xe driver, not i915
 # zswap.zpool dropped 2026-06-25: z3fold was removed from the kernel (gone by 7.x), so
@@ -1451,7 +1585,16 @@ done
 # 30% gives it ~9GB before it has to touch the encrypted device. The pool is a ceiling, not a
 # reservation, so it costs nothing when the box is not under memory pressure. Kept at 30 and
 # not higher because page cache on this media server is worth real money too.
-GRUB_CMDLINE_ADD="threadirqs usbcore.autosuspend=-1 nvme_core.default_ps_max_latency_us=0 zswap.enabled=1 zswap.shrinker_enabled=1 zswap.compressor=zstd zswap.max_pool_percent=30 mitigations=auto intel_pstate=active preempt=lazy tsc=reliable nmi_watchdog=0"
+# zswap.shrinker_enabled flipped 1 -> 0 (2026-11-13). The shrinker writes compressed pages
+# back to disk under memory pressure, and this box is under permanent page-cache pressure, so
+# it never stopped: in 11.6h of uptime zswpwb == pswpout == 5.37M pages (20GB onto the LUKS
+# NVMe) with pool_limit_hit=0 and the pool at 484MB, 1.5% of RAM against a 30% ceiling, and
+# 4.03M of those pages (15GB) were then faulted back in from disk. Every disk swap-out on the
+# box was the shrinker evicting pages zswap had room to keep. With it off, writeback over a
+# 240s window went from +5257 pages per 120s to exactly 0; zswap still writes back by LRU if
+# the pool ever reaches max_pool_percent. The mm unit asserts the same value at runtime so it
+# applies without waiting for a reboot.
+GRUB_CMDLINE_ADD="threadirqs usbcore.autosuspend=-1 nvme_core.default_ps_max_latency_us=0 zswap.enabled=1 zswap.shrinker_enabled=0 zswap.compressor=zstd zswap.max_pool_percent=30 mitigations=auto intel_pstate=active preempt=lazy tsc=reliable nmi_watchdog=0"
 
 if grep -q '^GRUB_CMDLINE_LINUX_DEFAULT=' /etc/default/grub; then
   CURRENT="$(grep '^GRUB_CMDLINE_LINUX_DEFAULT=' /etc/default/grub | \
@@ -1481,8 +1624,30 @@ fi
 purge_old_custom_kernels "$TAG_KVER"
 
 msg "updating initramfs and grub"
-update-initramfs -u -k all
-update-grub
+# Rebuild only when something they are built from has changed since the last rebuild. This
+# used to run unconditionally, so every daily no-op run regenerated the initramfs for every
+# installed kernel and rewrote grub.cfg: about a minute of CPU and a 1.0-1.4GB memory peak
+# (the unit's own accounting) on a box where RAM is the tightest resource, and a needless
+# rewrite of the two files the next boot depends on. Package upgrades that affect the
+# initramfs (cryptsetup, firmware, microcode) trigger their own rebuild through dpkg, so the
+# inputs to watch here are the files this script edits and the set of installed kernels.
+# The fingerprint is stored only after a successful rebuild, so a run that dies half way
+# rebuilds on the next one. NUC16PRO_FORCE_REGEN=1 forces it.
+BOOT_INPUTS_FILE="$STATE_DIR/boot-inputs.sha256"
+BOOT_INPUTS_NOW="$(boot_inputs_fingerprint)"
+TARGET_INITRD=""
+for f in /boot/initrd.img-*"${TAG_KVER}"*cachyos*nuc16pro*; do
+  if [ -s "$f" ]; then TARGET_INITRD="$f"; break; fi
+done
+if [ "$NEED_REBOOT_ONLY" -ne 2 ] || [ "${NUC16PRO_FORCE_REGEN:-0}" = 1 ] \
+   || [ -z "$TARGET_INITRD" ] || [ ! -s /boot/grub/grub.cfg ] \
+   || [ "$(cat "$BOOT_INPUTS_FILE" 2>/dev/null || true)" != "$BOOT_INPUTS_NOW" ]; then
+  update-initramfs -u -k all
+  update-grub
+  echo "$BOOT_INPUTS_NOW" > "$BOOT_INPUTS_FILE"
+else
+  echo "boot inputs unchanged since the last rebuild, leaving the initramfs and grub.cfg alone"
+fi
 
 msg "setting grub default"
 
@@ -1540,7 +1705,8 @@ systemctl status nuc16pro-scx-server.service --no-pager -l | head -60 || true
 systemctl status scx_loader.service --no-pager -l | head -30 2>/dev/null || true
 [ -r /sys/kernel/sched_ext/state ] && echo "sched_ext: $(cat /sys/kernel/sched_ext/state)"
 
-# RAPL power limits readback: confirm BIOS didn't lock/override our writes
+# RAPL power limits, read only. Nothing here writes them (BIOS owns PL1/PL2/Tau); they are
+# printed so the limits in force are on record in every run's log.
 if [ -d /sys/class/powercap/intel-rapl/intel-rapl:0 ]; then
   p=/sys/class/powercap/intel-rapl/intel-rapl:0
   echo "rapl pl1:   $(cat "$p/constraint_0_power_limit_uw")uW"

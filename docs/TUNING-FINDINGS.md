@@ -16,6 +16,11 @@ Back to the [README](../README.md).
 | [11](#11-hardware-ceiling-audit) | Hardware ceiling audit: what is maxed and what cannot be |
 | [12](#12-verification-discipline) | Verification discipline |
 | [13](#13-routine-checkup-2026-09-01) | Routine checkup: Vulkan status and the scx mode question |
+| [14](#14-drift-check-corrected-2026-09-13) | Drift check corrected: CachyOS PKGBUILD, not kernel.org |
+| [15](#15-drift-check-now-clears-the-drift-and-the-ci-got-its-own-ci-2026-09-17) | Drift check dispatches the build; the CI got its own CI |
+| [16](#16-three-way-benchmark-stock-vs-servermax-vs-ultimate-2026-09-26) | Three-way benchmark: the candidates measured as noise |
+| [17](#17-the-25gbe-bond-carries-no-outbound-traffic-wifi-7-mlo-is-the-real-path-2026-09-26) | The bond carried no outbound traffic (since re-routed, see 18) |
+| [18](#18-deep-audit-zswap-was-leaking-to-disk-and-the-kernel-was-built--o2-2026-11-13) | Deep audit: zswap shrinker, `-O3`, the thermal ceiling, self-update |
 
 ---
 
@@ -689,3 +694,144 @@ Section 16 proposed testing BBR "against a second host across the bond". That te
 BBR held up, but it crossed WiFi, not the bond, because the bond cannot send. The result
 stands as a real-network measurement, but it crossed WiFi: the word "bond" in that sentence
 was wrong.
+
+---
+
+## 18. Deep audit: zswap was leaking to disk, and the kernel was built -O2 (2026-11-13)
+
+A full read of every tracked file plus a live audit of the box. Most of what it found was
+documentation that had stopped being true and small robustness gaps. Two findings were not
+small, and both had been sitting in plain sight behind a number that looked healthy.
+
+### The zswap shrinker was evicting to disk with the pool nearly empty
+
+Earlier sections tracked a "zswap refault ratio" (`zswpin / zswpout`) and read a high value as
+an under-sized pool, which is why the pool ceiling went from 20% to 30% in section 10. That
+ratio measures something harmless: compressed pages being reused from RAM, which is zswap
+working. The counters that cost something were never looked at. After 11.6 hours of uptime:
+
+| counter | value | meaning |
+| ------- | ----- | ------- |
+| `zswpout` | 25,170,953 | pages compressed into the pool |
+| `zswpwb` | 5,372,462 | compressed pages written back to the swap device |
+| `pswpout` | 5,372,462 | all pages written to the swap device |
+| `pswpin` | 4,032,292 | pages read back from the swap device |
+| `pool_limit_hit` | 0 | times the pool reached its ceiling |
+| pool size | 484 MB | 1.5% of RAM, against a 30% ceiling |
+
+`zswpwb` equals `pswpout` to the page. Every disk swap-out on the box was the zswap shrinker
+evicting a page the pool had room to keep, and three quarters of those pages were then
+faulted back in from the encrypted NVMe. That is 20GB written and 15GB read in half a day,
+for data that compresses about 4:1 and would have fitted in roughly 3GB of RAM.
+
+The shrinker (`zswap.shrinker_enabled=1`, set by this repo through both the kernel command
+line and the Kconfig fragment) writes back under memory pressure. It suits a machine whose
+pressure comes and goes. This one is under permanent page-cache pressure from a torrent client
+reading hundreds of GB a day, so the shrinker never stops. Raising the pool ceiling could not
+help, because the ceiling was never the limit.
+
+A/B on the live box, same workload, consecutive windows:
+
+| window | `zswpwb` delta | `pswpin` delta |
+| ------ | -------------- | -------------- |
+| shrinker on, 120s | +5,257 pages | +2,630 pages |
+| shrinker off, 240s | **0 pages** | +5,409 pages (older pages still on disk coming home) |
+
+This is a counter going to zero, not a throughput delta inside the noise floor, so it does not
+need the interleaved-pairs treatment from section 12. The shrinker is now off in three places:
+the kernel command line, the Kconfig default, and `nuc16pro-servermax-mm.service`, which
+asserts it at runtime so the change does not wait for a reboot. zswap still evicts by LRU if
+the pool ever reaches `max_pool_percent`, so the limit is intact; only the early eviction is
+gone. The healthcheck reports `zswpwb` and `pswpin` and flags the shrinker if it comes back.
+
+What to watch afterwards: the pool should grow to a few GB and `pswpin` should decay toward
+zero as pages that are still on disk migrate back. If `pool_limit_hit` starts counting, the
+30% ceiling has become the real limit and that is the moment to revisit it.
+
+### The kernel was -O2; CachyOS ships -O3
+
+`scripts/build-cachyos-server.sh` copies the base `config` from the PKGBUILD directory and
+merges the servermax fragment over it. It never runs the PKGBUILD `prepare()` function, and
+`prepare()` is where CachyOS applies its own defaults with `scripts/config`. The base file says
+`CONFIG_CC_OPTIMIZE_FOR_PERFORMANCE=y`; `prepare()` flips that to `-O3` because `_cc_harder`
+defaults to `yes`. So every kernel this pipeline has published was built `-O2` while every
+stock CachyOS kernel is `-O3`, and nothing reported it.
+
+The fragment now sets `CONFIG_CC_OPTIMIZE_FOR_PERFORMANCE_O3=y` and also
+`CONFIG_X86_64_VERSION=3`, so the v3 baseline is expressed in Kconfig as well as in `KCFLAGS`.
+The build reads both back from the final `.config`, writes the real optimisation level into
+`BUILD_MANIFEST`, and warns if either failed to apply.
+
+This one is stated honestly as **parity, not a measured win**. It cannot be A/B tested with
+`nuc16pro-bench.sh`, which compares runtime profiles on one kernel image, and section 16 put
+the noise floor at 28-33%. It ships because the deviation from upstream was an accident of how
+the config is assembled, not a decision, and `-O3` is the configuration CachyOS tests and
+releases. The rest of `prepare()` was compared option by option: timer frequency, preemption,
+THP mode and LTO differ from upstream here on purpose and are unchanged.
+
+### Sustained CPU power is limited by the cooler, at about 57W
+
+A 75 second all-core run, sampled every 5 seconds:
+
+| state | package power | package temp | PL1 (MSR / MMIO) | limit reason |
+| ----- | ------------- | ------------ | ---------------- | ------------ |
+| idle, live load | 12-15 W | 66-83 C | 200 W / 95 W | none |
+| all-core, 5s to 75s | 56-58 W | 95-96 C | 200 W / 95 W | thermal |
+
+Power limits are nowhere near binding. The package reaches 95C inside five seconds and stays
+there at 57W with the thermal bit set in `MSR_CORE_PERF_LIMIT_REASONS`. The thermal target is
+95C because `MSR_TEMPERATURE_TARGET` carries a TCC activation offset of 5C below the 100C
+TjMax, and that field is locked by firmware: writing `tcc_offset_degree_celsius` returns
+`EPERM`. The 80W in the specification is a burst figure on this chassis.
+
+So nothing in this repository can raise sustained all-core throughput. The remaining headroom
+is physical and in firmware: the BIOS fan curve, the BIOS TCC activation offset if it is
+exposed, thermal interface material, and airflow around the case. Fan control stays with the
+BIOS, as before. This also retires the claim in section 11 that sustained CPU power is bounded
+by the 80W MTP cap: the cap that binds is thermal, about 23W below it.
+
+### Corrections to earlier sections
+
+- **Section 17, the bond.** The routing was put back as designed at some point after
+  2026-09-26. The bond holds the default route at the lower metric and carried several hundred
+  GB of egress in one boot; WiFi is the higher-metric fallback and carried none. The igc ring
+  sizing and the hash policy are therefore live again, not inert.
+- **Section 13, the scx-loader version.** The build fell back to the *default branch* of
+  scx-loader when no tag matched scx, so the v1.1.4 release shipped a loader built from v1.1.3
+  plus two unreleased commits. It now falls back to the newest release tag.
+- **Section 10 and README section 8, the boot ENOMEM.** `try_primary` belongs to the direct
+  unit, which is disabled once `scx_loader` owns the scheduler. Under the loader the three
+  early failures (10.6s to 11.5s) are absorbed by the loader relaunching the scheduler, which
+  attaches at 11.8s, before docker starts at 17.4s.
+- **Section 11, memory.** "30% of zswap writeouts get read back" described healthy reuse from
+  RAM. The real cost was the disk writeback above.
+- **The Oracle A1 fallback build** is disabled and its runner is offline. One builder runs.
+
+### What the audit fixed in the updater
+
+| defect | effect | fix |
+| ------ | ------ | --- |
+| A new scx release restarted the wrong unit | The disabled direct unit was started, the restart "succeeded", and `scx_loader` kept the old binary loaded | Restart whichever unit owns sched_ext |
+| Work directory under `/tmp` with fixed file names | A local user could pre-create it and swap a package between checksum and `dpkg -i`, as root | Root-only directory under `/var/cache` |
+| Bare `curl`, default 30-release page | A stalled connection held the lock forever; the slower release stream could fall off page one | Timeouts, retries, `per_page=100` |
+| Initramfs and grub rebuilt on every run | About a minute of CPU and a 1.0-1.4GB memory peak nightly with nothing changed | Rebuild only when an input changed |
+| No retention | 164 logs and 158 backup directories after five months | Keep the newest 60 and 30 |
+| `daemon.json` rewritten in place every run | A crash mid-write could leave dockerd an invalid config | Write through a rename, only on change |
+| The installed updater never updated | Fixes pushed here did not reach the box without a manual copy | Self-update from the release asset |
+
+In CI: the build pre-flight no longer sources the third-party PKGBUILD in a step that holds a
+release-publishing token, the kernel tarball is verified against the PKGBUILD checksum before
+it is unpacked, the lint workflow lost the path filter that let `systemd/` and `sysctl.d/`
+changes skip the host-data audit, and the repo audit gained a check that the README quotes the
+real kernel command line from the updater (it had said `zswap.max_pool_percent=20` for three
+months).
+
+### Considered and not shipped
+
+| candidate | why not |
+| --------- | ------- |
+| `-march=pantherlake` or `-mtune=pantherlake` | The kernel is built without SSE/AVX code generation, so the gain is small, and CPU-specific instructions would crash the QEMU/KVM boot test on the build runner, which is the only gate between a build and an unattended install. |
+| AutoFDO / Propeller kernel | Supported by this tree (`CONFIG_AUTOFDO_CLANG`) and the largest remaining compiler lever, but it needs an LBR profile collected on this box, a profile conversion step and a rebuild loop. A project of its own, not an audit fix. |
+| Raising `vm.swappiness` now that zswap keeps pages in RAM | Plausible, since compressed RAM is cheaper than re-reading page cache from disk. Change one thing at a time: let the shrinker change settle and read `pswpin` and PSI first. |
+| zswap `lz4` instead of `zstd` | The harness has a mode for it. Not run in this pass; with the shrinker off the decompress path matters more, so it is the next measurement to take. |
+| Releasing the 512MB kdump reservation | Real RAM on a memory-bound box, but it buys crash dumps on a remotely administered machine. Operator decision; the healthcheck now reports it. |

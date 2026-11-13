@@ -1,5 +1,5 @@
 [Unit]
-Description=NUC 16 Pro ServerMax memory tuning (multi-size THP orders + DAMON proactive reclaim)
+Description=NUC 16 Pro ServerMax memory tuning (multi-size THP orders on, zswap shrinker off, KSM and DAMON reclaim off)
 # Ordered like the scx_loader drop-in, NOT After=multi-user.target. The mm policy has to be
 # in place before dockerd forks the container fleet, otherwise ~70 containers fault in their
 # anonymous memory under the old policy and only inherit the new one for later allocations.
@@ -39,6 +39,21 @@ ExecStart=/bin/sh -c 'for o in 16 32 64; do e=/sys/kernel/mm/transparent_hugepag
 # Let the kernel reclaim THPs that are mostly zero-filled instead of pinning the memory.
 # Matters more once the mid orders are live, since there are simply more THPs around.
 ExecStart=/bin/sh -c '[ -w /sys/kernel/mm/transparent_hugepage/shrink_underused ] && echo 1 > /sys/kernel/mm/transparent_hugepage/shrink_underused || true'
+
+# --- zswap shrinker: OFF, measured -------------------------------------------------------
+# The shrinker writes compressed pages back to the swap device under memory pressure. That
+# suits a machine whose pressure comes and goes. This one is under permanent page-cache
+# pressure (a torrent client reading hundreds of GB a day), so the shrinker never stopped.
+# Counters after 11.6h of uptime, 2026-11-13:
+#   zswpwb 5372462 == pswpout 5372462   every disk swap-out on the box was zswap writeback
+#   pool_limit_hit 0, pool 484MB        1.5% of RAM in use against a 30% ceiling
+#   pswpin 4032292                      75% of what it wrote out was faulted back from disk
+# That is 20GB written to and 15GB read back from the LUKS NVMe for pages zswap had room to
+# keep compressed in RAM at roughly 4:1. With the shrinker off, writeback over the next 240s
+# was exactly 0 pages, against 5257 in the 120s before. zswap still evicts by LRU if the
+# pool ever reaches max_pool_percent, so this removes the early eviction, not the limit.
+# Also on the kernel command line; asserted here so it applies without a reboot.
+ExecStart=/bin/sh -c '[ -w /sys/module/zswap/parameters/shrinker_enabled ] && echo N > /sys/module/zswap/parameters/shrinker_enabled || true'
 
 # --- KSM: deliberately OFF ---------------------------------------------------------------
 # Tested on this box, not assumed. KSM was enabled with advisor_mode=scan-time and left to

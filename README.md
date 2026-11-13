@@ -77,8 +77,8 @@ established by measurement; the number behind them is in
 | Setting         | Value                                                                                                                                                                                                                                         |
 | --------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | Base scheduler  | EEVDF (servermax profile)                                                                                                                                                                                                                     |
-| sched_ext       | Compiled in (`CONFIG_SCHED_CLASS_EXT=y`), `scx_flash` auto-starts before the docker fleet (unit ordered `After=basic.target Before=docker.service`, bounded retry on boot-storm ENOMEM; verifies attach, falls back to `scx_bpfland`) |
-| Compiler        | LLVM / Clang + LLD                                                                                                                                                                                                                            |
+| sched_ext       | Compiled in (`CONFIG_SCHED_CLASS_EXT=y`). `scx_loader` starts `scx_flash` before the docker fleet (drop-in orders it `After=basic.target Before=docker.service`) and relaunches it until it attaches; a direct unit with a verified fallback chain takes over if the loader is absent |
+| Compiler        | LLVM / Clang + LLD, `-O3` (the CachyOS default; see [finding 18](docs/TUNING-FINDINGS.md#18-deep-audit-zswap-was-leaking-to-disk-and-the-kernel-was-built--o2-2026-11-13))                                                                     |
 | LTO             | ThinLTO                                                                                                                                                                                                                                       |
 | CPU target      | x86-64-v3 (AVX2, BMI2, FMA, LZCNT). v4 is impossible on this silicon: no AVX-512 ([audit](docs/TUNING-FINDINGS.md#11-hardware-ceiling-audit))                                                                                                  |
 | Timer frequency | 100 Hz (`CONFIG_HZ_100`)                                                                                                                                                                                                                    |
@@ -95,13 +95,13 @@ established by measurement; the number behind them is in
 | Transparent Huge Pages | always,**plus multi-size THP (mTHP) orders 16k/32k/64k enabled** ([measured](docs/TUNING-FINDINGS.md#multi-size-thp-mthp-the-biggest-single-win)) |
 | mTHP shrinker          | `shrink_underused=1`: reclaim mostly-zero THPs instead of pinning the memory                                                                         |
 | MGLRU                  | Fully enabled (`0x0007`), the multi-generational LRU doing the cold-anon work                                                                        |
-| Zswap                  | Enabled at boot, zstd compressor, zsmalloc pool,**30%** pool ceiling, shrinker on ([measured](docs/TUNING-FINDINGS.md#smaller-items))             |
+| Zswap                  | Enabled at boot, zstd compressor, zsmalloc pool, **30%** pool ceiling, **shrinker off**: with it on, every disk swap-out was zswap writeback, 20GB in 11.6h with the pool at 1.5% of RAM ([measured](docs/TUNING-FINDINGS.md#18-deep-audit-zswap-was-leaking-to-disk-and-the-kernel-was-built--o2-2026-11-13)) |
 | Proactive reclaim      | None. DAMON_RECLAIM tried, reclaimed 0 bytes in 19h, dropped ([measured](docs/TUNING-FINDINGS.md#smaller-items))                                        |
 | KSM                    | Off, deliberately: measured negative`general_profit` here ([measured](docs/TUNING-FINDINGS.md#tested-and-rejected))                                   |
 | Swappiness             | `vm.swappiness=10` (swap only under real pressure; zswap absorbs the rest)                                                                           |
 | Cache pressure         | `vm.vfs_cache_pressure=50` (keep dentry/inode cache for ~80 containers)                                                                              |
 | Dirty writeback        | `vm.dirty_background_ratio=5`, `vm.dirty_ratio=20`                                                                                                 |
-| Known ceiling          | RAM capacity is the tightest resource, but PSI says it is not stalling: idle `memory some avg10=0.00 avg60=0.00`, MemAvailable ~14GB ([audit](docs/TUNING-FINDINGS.md#11-hardware-ceiling-audit))                                   |
+| Known ceiling          | RAM capacity is the tightest resource (about 12GB in swap with ~90 containers), but PSI says it is not stalling: `memory some avg60` under 1%, MemAvailable 11-13GB ([audit](docs/TUNING-FINDINGS.md#11-hardware-ceiling-audit))       |
 
 ### Storage and I/O
 
@@ -126,7 +126,7 @@ established by measurement; the number behind them is in
 | TCP Fast Open       | `net.ipv4.tcp_fastopen=3` (client and server)                               |
 | Socket buffers      | `rmem_max`/`wmem_max` 128MB, `tcp_rmem`/`tcp_wmem` autotuned to 128MB |
 | Backlog             | `net.core.netdev_max_backlog=16384`                                         |
-| Bonding             | 2x 2.5GbE bonded (balance-xor, static LAG; see section 5). **Currently inert: bond0 has no route and carries no outbound traffic; egress is WiFi 7 MLO** ([finding 17](docs/TUNING-FINDINGS.md#17-the-25gbe-bond-carries-no-outbound-traffic-wifi-7-mlo-is-the-real-path-2026-09-26)) |
+| Bonding             | 2x 2.5GbE bonded (balance-xor, static LAG; see section 5). Carries the default route as of 2026-11-13, with WiFi as the higher-metric fallback. It was found unrouted on 2026-09-26 ([finding 17](docs/TUNING-FINDINGS.md#17-the-25gbe-bond-carries-no-outbound-traffic-wifi-7-mlo-is-the-real-path-2026-09-26)); the healthcheck reports which interface holds the default route so a relapse is visible |
 | Reverse path filter | `rp_filter=2` loose, required for asymmetric paths across bond0 + wlo1      |
 | igc ring buffers    | rx=4096 tx=4096 on both I226-V 2.5GbE ports                                   |
 | Network offload     | TLS kernel offload, XDP sockets                                               |
@@ -146,7 +146,7 @@ established by measurement; the number behind them is in
 | Setting          | Value                                                                                         |
 | ---------------- | --------------------------------------------------------------------------------------------- |
 | P-state driver   | `intel_pstate=active` (hardware-managed P-states / HWP)                                     |
-| CPU power limits | BIOS-owned PL1/PL2/Tau; silicon caps at 80W MTP                                               |
+| CPU power limits | BIOS-owned PL1/PL2/Tau; silicon caps at 80W MTP. Sustained all-core is cooler-limited at about 57W / 95C ([measured](docs/TUNING-FINDINGS.md#18-deep-audit-zswap-was-leaking-to-disk-and-the-kernel-was-built--o2-2026-11-13)) |
 | Fan control      | BIOS/firmware owns curves; the OS does not set them                                           |
 | energy_perf_bias | 0 (no microarchitecture power-saving bias on any core)                                        |
 | Uncore frequency | `intel_uncore_freq_control` built as a module for ring/fabric visibility                    |
@@ -171,6 +171,8 @@ established by measurement; the number behind them is in
 
 Panther Lake has 4P + 8E + 4LP-E = 16C/16T with Intel Thread Director + HFI, heterogeneous topology.
 
+`scx_loader` (the upstream DBus loader, with `scxctl` as its CLI) owns the scheduler on this box: it starts `scx_flash` at boot and relaunches it if an attach fails. The direct unit and start script described below are the fallback path, used only where `scx_loader` is not installed or fails to start.
+
 - **Primary**: `scx_flash` (EDF scheduler with dynamic per-task latency weights; prioritizes latency-sensitive tasks that yield early, deprioritizes batch tasks that burn their full slice - well matched to Plex transcode running alongside interactive streaming + high-speed networking)
 - **Fallback chain**: `scx_bpfland -s 20000 -S` -> `scx_p2dq` -> `scx_bpfland` (no args) -> `scx_rusty` -> `scx_beerland` -> `scx_lavd`
 
@@ -180,11 +182,9 @@ The start script **verifies each scheduler actually attaches** to sched_ext (`/s
 
 `scx_lavd` is topology-aware for P/E/LP-E but has a documented E-core over-prioritization issue (observed on the sibling Lunar Lake architecture). It remains as a late fallback until upstream resolves it.
 
-`scx_loader` is preferred when available; it handles kernel upgrades without a service restart.
-
 ## Pipeline
 
-Two independent build paths produce identical `.deb` packages. The Oracle A1 workflow runs 12 hours after GHA as a fallback. If GHA already built successfully, Oracle's pre-flight check finds the release and skips.
+Two build paths are defined and produce identical `.deb` packages. The GitHub-hosted workflow is the one that runs. The Oracle A1 workflow is a fallback designed to run 12 hours later and skip when a release already exists; it is **currently disabled** and its self-hosted runner is offline (checked 2026-11-13), so today there is one builder. Re-enable it under Actions if the fallback is wanted again.
 
 ```text
 GHA ubuntu-latest (native x86-64, daily 09:00 UTC)
@@ -238,7 +238,10 @@ After building, each workflow checks the kernel. On failure the build stops and 
 - `linux-headers-*.deb`: headers for DKMS / out-of-tree modules
 - `linux-libc-dev_*.deb`: userspace kernel headers
 - `SHA256SUMS`: SHA-256 checksums for all packages
-- `BUILD_MANIFEST`: compiler version, CachyOS commit, build timestamp, full config metadata
+- `BUILD_MANIFEST`: compiler version, CachyOS commit, build timestamp, config metadata (the optimisation level is read back from the built `.config`, not assumed)
+- `nuc16pro-kernel-updater.sh` + `.sha256`: the updater as it was on master at build time, which installed copies use to refresh themselves (see [self-update](#3-what-the-installer-does-automatically))
+
+The kernel source tarball is verified against the checksum recorded in the CachyOS PKGBUILD before it is unpacked, and the build stops if they differ or no checksum is published.
 
 Release tag format: `v{KERNEL}-cachyos-servermax-nuc16pro-x86_64v3-{YYYYMMDD}.{RUN}`
 
@@ -269,11 +272,11 @@ gh attestation verify linux-image-*.deb \
 | workflow | trigger | what it does |
 |---|---|---|
 | `build-cachyos-server.yml` | 09:00 UTC daily, drift dispatch, manual | primary kernel build on a GitHub-hosted runner, QEMU/KVM boot test, release |
-| `build-cachyos-server-oracle.yml` | 21:00 UTC daily, manual | fallback cross-build on the self-hosted Oracle A1; skips when the primary already released |
+| `build-cachyos-server-oracle.yml` | 21:00 UTC daily, manual (currently disabled) | fallback cross-build on the self-hosted Oracle A1; skips when the primary already released |
 | `build-scx-schedulers.yml` | 03:00 UTC daily, drift dispatch, manual | builds sched-ext/scx schedulers plus `scx_loader`/`scxctl` |
 | `version-drift-check.yml` | every 4 h, after any build, manual | compares released versions to upstream and dispatches the build that clears any drift |
 | `check-kernel-updater-sync.yml` | push/PR touching the updater's sources | regenerates the updater and fails if the committed copy differs |
-| `lint-ci.yml` | push/PR touching `.github/` or `scripts/` | actionlint, zizmor (Actions security audit), shellcheck, generated-file check |
+| `lint-ci.yml` | every push to master, every PR | actionlint, zizmor (Actions security audit), shellcheck, generated-file check, repo audit |
 
 Every third-party action is pinned to a commit SHA, Dependabot bumps them weekly in one grouped
 PR, and `lint-ci.yml` audits the workflows themselves so a broken expression or an over-broad
@@ -366,6 +369,7 @@ Timer fires daily at 04:00 local time. The installer is idempotent: records the 
 
 On first run and each new release, the installer handles everything without manual steps:
 
+- **Updates itself.** Each kernel release carries the updater that was on master when it was built, with its sha256. When a release this box has not seen before appears and the copies differ, the new one is checksum-verified, syntax-checked and swapped in for the next run, with the previous copy kept as `nuc16pro-kernel-updater.sh.prev`. A copy deployed by hand survives until the next kernel release. This grants nothing new: whoever can publish a release here already ships the `.deb`s this script installs as root. `NUC16PRO_SELF_UPDATE=0` in the unit's environment turns it off
 - Downloads and verifies `.deb` packages (SHA-256)
 - Installs kernel packages via `dpkg`
 - Installs `linux-image-generic` as fallback
@@ -376,18 +380,24 @@ On first run and each new release, the installer handles everything without manu
 - Writes `/etc/sysctl.d/99-nuc16pro-servermax.conf` (BBR+FQ, large buffers, inotify, vm tuning, `rp_filter=2` for dual NIC)
 - Writes `/etc/udev/rules.d/60-nuc16pro-ioschedulers.rules` (ADIOS for SSDs/NVMe, BFQ for HDDs) plus `/etc/modules-load.d/nuc16pro-adios.conf` - adios is built `=m` and lacks the `<name>-iosched` autoload alias bfq has, so without force-loading it the udev rule silently no-ops and SSD/NVMe fall back to mq-deadline/none
 - Installs and enables `/etc/systemd/system/nuc16pro-servermax-cpupower.service` (EPP=performance, HWP dynamic boost, and platform_profile=performance on all P/E/LP-E cores; masks `power-profiles-daemon` so it stays the single owner). The cpufreq `scaling_governor` is left at **`powersave` on purpose, this is not a downgrade**: under `intel_pstate` active mode + HWP the governor name is misleading, the hardware auto-scales each core from ~400 MHz idle to full ~4.7 GHz turbo on demand, biased hard toward performance by `EPP=performance` + `hwp_dynamic_boost=1`. A pinned `performance` governor would hold *idle* cores at max P-state too, wasting power budget that, under the 80 W MTP cap, is better handed to the *loaded* cores so they turbo higher. So `powersave`+EPP=performance is the faster config here and still ramps to max exactly when needed.
-- Installs and enables `/etc/systemd/system/nuc16pro-servermax-power.service` (BIOS owns PL1/PL2/Tau and the platform profile; the OS sets only energy_perf_bias=0, NVMe nr_requests=1023, igc ring buffers on every I226-V port, and the TjMax 100°C thermal trip, all within the BIOS power envelope)
+- Installs and enables `/etc/systemd/system/nuc16pro-servermax-power.service` (BIOS owns PL1/PL2/Tau and the fan curves; this unit sets only energy_perf_bias=0, NVMe nr_requests=1023, igc ring buffers on every I226-V port, and the TjMax 100°C thermal trip, all within the BIOS power envelope)
+- Installs and enables `/etc/systemd/system/nuc16pro-servermax-mm.service` (mTHP orders 16k/32k/64k on, zswap shrinker off, KSM and DAMON reclaim asserted off)
+- Appends `no-read-workqueue,no-write-workqueue` to every `/etc/crypttab` entry that lacks them (one-time backup at `/etc/crypttab.nuc16pro-servermax.bak`), refreshes the mapping live where a keyfile allows it, and rebuilds the initramfs when an entry changed
+- Merges log rotation (`50m` x 3, compressed) and `live-restore` into `/etc/docker/daemon.json`, keeping every existing key (one-time backup beside it). The file is rewritten only when something changed, through a rename; dockerd is never restarted
 - Writes `/etc/systemd/system/plymouth-quit-wait.service.d/10-headless-noop.conf` - this headless box has no graphical handoff, so the stock `plymouth --wait` blocks `multi-user.target` forever (infinite timeout) and starves every `After=multi-user.target` unit including the tuning oneshots; the drop-in replaces it with a no-op so the target completes and tuning applies on boot
 - Downloads the 6 schedulers (`scx_flash`, `scx_bpfland`, `scx_p2dq`, `scx_rusty`, `scx_beerland`, `scx_lavd`) plus `scx_loader` + `scxctl` and their systemd/DBus/polkit files from this repo's own `scx-*` GitHub release (built by `build-scx-schedulers.yml`, which also builds `sched-ext/scx-loader`), verifies against `SHA256SUMS`, installs binaries to `/usr/local/bin` and the control plane to the DBus/systemd/polkit dirs
-- Enables `scx_loader` with `scx_flash` in Server mode (or direct service as fallback)
+- Enables `scx_loader` with `scx_flash` in Server mode (or direct service as fallback), plus a drop-in ordering it before `docker.service`; when a new scx release lands it restarts whichever unit owns the scheduler
 - Installs and enables `nuc16pro-healthcheck.timer`: a read-only post-boot (~5 min) and daily health report (kernel, failed units, sched_ext attach state + cgroup_init count, xe/firmware, VA-API, bond, memory, thermal, NVMe SMART, docker health) logged to the journal (`journalctl -u nuc16pro-healthcheck`)
-- Updates GRUB cmdline: `threadirqs usbcore.autosuspend=-1 nvme_core.default_ps_max_latency_us=0 zswap.enabled=1 zswap.shrinker_enabled=1 zswap.compressor=zstd zswap.max_pool_percent=20 mitigations=auto intel_pstate=active preempt=lazy tsc=reliable nmi_watchdog=0` and strips `splash` (headless box: the plymouth splash starves `multi-user.target`, complementing the plymouth-quit-wait drop-in above). `tsc=reliable` skips the clocksource watchdog (TSC is constant/nonstop/known-freq); `nmi_watchdog=0` frees the per-core perf counter the hard-lockup detector holds. `zswap.zpool=z3fold` dropped: z3fold was removed upstream, zswap falls back to the zsmalloc default. `mitigations=auto` kept on (internet-exposed).
+- Updates GRUB cmdline: `threadirqs usbcore.autosuspend=-1 nvme_core.default_ps_max_latency_us=0 zswap.enabled=1 zswap.shrinker_enabled=0 zswap.compressor=zstd zswap.max_pool_percent=30 mitigations=auto intel_pstate=active preempt=lazy tsc=reliable nmi_watchdog=0` and strips `splash` (headless box: the plymouth splash starves `multi-user.target`, complementing the plymouth-quit-wait drop-in above). `tsc=reliable` skips the clocksource watchdog (TSC is constant/nonstop/known-freq); `nmi_watchdog=0` frees the per-core perf counter the hard-lockup detector holds. `zswap.zpool=z3fold` dropped: z3fold was removed upstream, zswap falls back to the zsmalloc default. `mitigations=auto` kept on (internet-exposed).
 - Removes stale `i915.enable_guc=3` if present from previous config
 - Purges all previous custom `cachyos-nuc16pro` kernels, keeping only the newest installed + the currently running kernel (panic fallback)
 - Adds `lz4` and `asus_wmi` to initramfs modules
-- Runs `update-initramfs` + `update-grub`
+- Runs `update-initramfs` + `update-grub` when a kernel was installed or one of their inputs changed (`/etc/default/grub`, `crypttab`, the initramfs module list, the modprobe files above, the set of installed kernels). A daily run that changes nothing leaves both alone; before 2026-11-13 it rebuilt every initramfs every night, about a minute of CPU and a 1.0-1.4GB memory peak. `NUC16PRO_FORCE_REGEN=1` forces a rebuild
 - Sets the new kernel as GRUB default (hidden menu, Shift to show)
-- Reboots
+- Keeps the newest 60 run logs and 30 grub backups
+- Reboots, only when a new kernel was installed
+
+Downloads land in `/var/cache/nuc16pro-kernel-updater` (root-only), not `/tmp`, and every network read has a timeout and retries.
 
 ### 4. sched_ext schedulers
 
@@ -414,7 +424,7 @@ scxctl start --scheduler scx_flash --mode Server
 
 The box has two Intel I226-V 2.5GbE ports plus WiFi 7. The two wired ports are bonded for aggregate LAN throughput and link redundancy; WiFi was intended as a separate failover path.
 
-> **What is actually happening (2026-09-26):** the roles are reversed. `bond0` holds an address and both slaves link at 2500 Mbps, but it has no route in any table and has transmitted zero bytes. All egress leaves over WiFi 7 MLO, which measures as the bond's equal (2.32 vs 2.36 Gbit/s to the same client). Inbound still arrives over ethernet, which is what `rp_filter=2` exists for. This is accepted rather than fixed; the detail and the measurements are in [finding 17](docs/TUNING-FINDINGS.md#17-the-25gbe-bond-carries-no-outbound-traffic-wifi-7-mlo-is-the-real-path-2026-09-26). Everything below describes the bond's intended design.
+> **State of the two paths.** On 2026-09-26 the roles were found reversed: `bond0` held an address with both slaves linked at 2500 Mbps but had no route in any table, and all egress left over WiFi 7 MLO ([finding 17](docs/TUNING-FINDINGS.md#17-the-25gbe-bond-carries-no-outbound-traffic-wifi-7-mlo-is-the-real-path-2026-09-26)). By 2026-11-13 the routing had been put back as designed: `bond0` holds the default route at the lower metric and carried hundreds of GB of egress in one boot, with WiFi as the higher-metric fallback and no outbound traffic. Routing lives in the box's own network configuration, not in this repo, so check rather than assume: the healthcheck prints which interface holds the default route and each interface's byte counters.
 
 **This box uses `balance-xor` (static LAG).** The upstream switch is a Grandstream GWN7721 (Lite-managed), which supports **static** link aggregation only - no LACP / 802.3ad. So the bond runs `mode: balance-xor` to match a static trunk: both ports active, TX spread across them by the hash policy. The bond mode must match the switch LAG type (static <-> `balance-xor`, LACP <-> `802.3ad`) or the link flaps. If your switch *does* support 802.3ad, use `mode: 802.3ad` + `lacp-rate: fast` instead (cleaner, switch-negotiated, detects miswiring).
 
@@ -464,7 +474,7 @@ Frequency scaling stays aggressive via `nuc16pro-servermax-cpupower.service`, wh
 To check power and thermal state (the RAPL reads show the BIOS-set limits):
 
 ```bash
-cat /sys/firmware/acpi/platform_profile                                       # current profile (BIOS default)
+cat /sys/firmware/acpi/platform_profile                                       # current profile (performance, set by the cpupower unit)
 cat /sys/class/powercap/intel-rapl/intel-rapl:0/constraint_0_power_limit_uw   # BIOS-set PL1
 cat /sys/class/powercap/intel-rapl/intel-rapl:0/constraint_1_power_limit_uw   # BIOS-set PL2
 sensors  # requires lm-sensors
@@ -499,7 +509,7 @@ Ordinary VA-API decode/encode/transcode is unaffected. This is a firmware-versio
 
 ### 8. sched_ext boot ENOMEM (expected, self-healing)
 
-On this box `scx_flash`'s `ops.cgroup_init()` transiently fails `-ENOMEM` during the boot container storm (verified: several events per boot). This is not a fault. The start script's bounded `try_primary` retry re-attaches `scx_flash` once the storm eases, so the scheduler ends up attached and stable with the scx unit's `NRestarts=0` (systemd never even has to restart it). Verified steady state: `sched_ext: enabled`, `root/ops = flash_...`. No action needed; the fallback chain (`scx_bpfland` and the rest) and the systemd `Restart=on-failure` remain as deeper safety nets. The health-check reports the per-boot count so a genuine regression (scheduler ending up detached) is visible.
+On this box `scx_flash`'s `ops.cgroup_init()` can fail `-ENOMEM` in the first seconds of boot. This is not a fault. Measured on 2026-11-13: three failures between 10.6s and 11.5s, the scheduler attached at 11.8s, and `docker.service` did not start until 17.4s, so the whole container fleet was scheduled by `scx_flash` from birth. `scx_loader` relaunches the scheduler by itself until it attaches, and its unit shows `NRestarts=0` because the daemon never dies. Where `scx_loader` is absent, the direct unit's start script does the same job with a bounded `try_primary` retry and then a fallback chain (`scx_bpfland` and the rest). The health-check reports the per-boot failure count and whether a scheduler is attached, so a real regression (ending up on EEVDF) is visible.
 
 ### 9. Known-benign firmware messages (BIOS/EC, not the kernel)
 
@@ -526,6 +536,7 @@ so this file stays a reference for the box rather than a lab notebook. It covers
 | [15](docs/TUNING-FINDINGS.md#15-drift-check-now-clears-the-drift-and-the-ci-got-its-own-ci-2026-09-17) | Drift check now dispatches the build that clears the drift, guarded against recursion; workflows hardened and given their own lint/security CI |
 | [16](docs/TUNING-FINDINGS.md#16-three-way-benchmark-stock-vs-servermax-vs-ultimate-2026-09-26) | Three-way benchmark on the live box: the scx server slice and the TCP candidates all measured as NOISE and did not ship; the binding constraint is now measurement noise, not any kernel knob |
 | [17](docs/TUNING-FINDINGS.md#17-the-25gbe-bond-carries-no-outbound-traffic-wifi-7-mlo-is-the-real-path-2026-09-26) | The 2.5GbE bond has no route and carries zero outbound traffic; egress is WiFi 7 MLO, which measures as its equal. Wireless-to-wireless testing understates the radio by over 3x |
+| [18](docs/TUNING-FINDINGS.md#18-deep-audit-zswap-was-leaking-to-disk-and-the-kernel-was-built--o2-2026-11-13) | Deep audit: the zswap shrinker was writing 20GB to disk per 11.6h with the pool nearly empty (now off), the kernel had been built `-O2` instead of CachyOS's `-O3`, sustained CPU power is cooler-limited at 57W, and the updater learned to update itself |
 
 **Measuring a change before shipping it:** `scripts/nuc16pro-bench.sh` is the A/B harness that
 makes that rule satisfiable. It compares three runtime profiles (stock, servermax, and whatever
@@ -534,9 +545,10 @@ bias, treats the within-profile spread as the noise floor, and always restores s
 exit. Run `nuc16pro-bench.sh selftest` first: it benchmarks two identical profiles and must
 report NOISE, which is the only evidence its verdicts mean anything.
 
-**Checking the repo itself:** `scripts/repo-audit.sh` runs ten mechanical checks (shell and YAML
-syntax, the shell inside every workflow `run:` block, updater-vs-sources sync, splice markers,
-host-specific data, em dashes, action SHA pinning, `workflow_run` targets, and markdown
+**Checking the repo itself:** `scripts/repo-audit.sh` runs eleven mechanical checks (shell and
+YAML syntax, the shell inside every workflow `run:` block, updater-vs-sources sync, splice
+markers, host-specific data, em dashes in any tracked file, the README quoting the updater's
+real kernel command line, action SHA pinning, `workflow_run` targets, and markdown
 links/anchors). It runs in CI as part of `lint-ci.yml`.
 
 The short version of the rule those sections establish: **a tuning change stays only if it has
@@ -563,7 +575,8 @@ sudo /usr/local/sbin/nuc16pro-kernel-updater.sh
 ```bash
 ls /var/log/nuc16pro-kernel-updater/
 journalctl -u nuc16pro-kernel-updater.service
-journalctl -u nuc16pro-scx-server.service
+journalctl -u nuc16pro-healthcheck.service
+journalctl -u scx_loader.service          # or nuc16pro-scx-server.service on the fallback path
 ```
 
 ## Fallback

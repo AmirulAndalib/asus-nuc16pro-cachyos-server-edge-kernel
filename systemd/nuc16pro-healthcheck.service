@@ -1,6 +1,6 @@
 [Unit]
 Description=NUC 16 Pro ServerMax post-boot health report (read-only; logs to journal)
-After=multi-user.target docker.service nuc16pro-scx-server.service
+After=multi-user.target docker.service scx_loader.service nuc16pro-scx-server.service
 ConditionPathExists=/usr/local/sbin/nuc16pro-healthcheck
 
 [Service]

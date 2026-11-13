@@ -20,6 +20,16 @@ case "$(uname -r)" in
   *) flag "not running the custom servermax kernel" ;;
 esac
 note "uptime:$(uptime -p 2>/dev/null | sed 's/^up//' || true)"
+# Both reported, neither flagged. The kdump reservation is RAM the box cannot use, which is
+# worth seeing on a machine whose tightest resource is memory, but keeping crash dumps on a
+# remotely administered server is an operator decision.
+ck=$(cat /sys/kernel/kexec_crash_size 2>/dev/null || echo 0)
+if [ "${ck:-0}" -gt 0 ] 2>/dev/null; then
+  note "crashkernel reservation: $((ck / 1048576))MB held for kdump (crash kernel loaded: $(cat /sys/kernel/kexec_crash_loaded 2>/dev/null))"
+fi
+if [ -f /run/reboot-required ]; then
+  note "reboot required by: $(sort -u /run/reboot-required.pkgs 2>/dev/null | tr '\n' ' ')"
+fi
 
 sec systemd
 failed=$(systemctl --failed --no-legend --plain 2>/dev/null | awk '{print $1}')
@@ -39,10 +49,14 @@ if [ "$state" = enabled ] && [ -n "$ops" ]; then
 else
   flag "no scx scheduler attached (kernel EEVDF is active)"
 fi
-nr=$(systemctl show nuc16pro-scx-server.service -p NRestarts --value 2>/dev/null || echo '?')
-note "scx unit restarts this boot: $nr"
+# Ask the unit that actually owns sched_ext: scx_loader once it has taken over, the direct
+# unit otherwise. The direct unit is disabled under scx_loader and always answers 0.
+scxu=nuc16pro-scx-server.service
+systemctl is-active --quiet scx_loader.service 2>/dev/null && scxu=scx_loader.service
+nr=$(systemctl show "$scxu" -p NRestarts --value 2>/dev/null || echo '?')
+note "$scxu restarts this boot: $nr"
 cg=$(journalctl -b -k 2>/dev/null | grep -ciE 'cgroup_init\(\) failed')
-note "cgroup_init ENOMEM events this boot: $cg (boot-storm transient; absorbed by try_primary retry)"
+note "cgroup_init ENOMEM events this boot: $cg (early-boot transient; the scheduler is relaunched until it attaches)"
 
 sec gpu-xe
 [ -d /sys/bus/pci/drivers/xe ] && note "xe driver bound: yes" || flag "xe driver not bound"
@@ -198,8 +212,21 @@ fi
 if [ -f /sys/module/zswap/parameters/max_pool_percent ]; then
   note "zswap pool: $(cat /sys/module/zswap/parameters/max_pool_percent)% compressor=$(cat /sys/module/zswap/parameters/compressor 2>/dev/null)"
 fi
-zo=$(awk '/^zswpout/{o=$2} /^zswpin/{i=$2} END{if (o>0) printf "%d", i*100/o; else printf "0"}' /proc/vmstat)
-note "zswap refault ratio: ${zo}% of writeouts were read back (high = pool under-sized for the working set)"
+# zswap, by the counters that separate "working" from "leaking to disk". zswpin against
+# zswpout only says compressed pages get reused from RAM, which is zswap doing its job. The
+# numbers that cost something are zswpwb (compressed pages evicted to the swap device) and
+# pswpin (pages read back from that device). With the shrinker on, this box wrote 20GB to
+# disk in 11.6h while the pool sat at 1.5% of RAM, so the shrinker is asserted off and
+# flagged if it comes back.
+if [ -f /sys/module/zswap/parameters/shrinker_enabled ]; then
+  zs=$(cat /sys/module/zswap/parameters/shrinker_enabled)
+  zwb=$(awk '/^zswpwb /{print $2}' /proc/vmstat)
+  dsi=$(awk '/^pswpin /{print $2}' /proc/vmstat)
+  zpool=$(awk '/^Zswap:/{print int($2 / 1024)}' /proc/meminfo)
+  zheld=$(awk '/^Zswapped:/{print int($2 / 1024)}' /proc/meminfo)
+  note "zswap: ${zheld:-0}MB held in a ${zpool:-0}MB pool; shrinker=$zs; since boot ${zwb:-0} pages written back to disk, ${dsi:-0} swapped in from disk"
+  [ "$zs" = N ] || flag "zswap shrinker is on - it evicts to disk long before the pool is full on this box (nuc16pro-servermax-mm.service not applied?)"
+fi
 
 sec block-perf
 for d in /sys/block/nvme[0-9]n[0-9] /sys/block/sd[a-z]; do
@@ -302,12 +329,6 @@ fi
 mem_avail=$(awk '/^MemAvailable:/{printf "%d", $2/1024}' /proc/meminfo 2>/dev/null)
 mem_total=$(awk '/^MemTotal:/{printf "%d", $2/1024}' /proc/meminfo 2>/dev/null)
 [ -n "$mem_avail" ] && note "memory available: ${mem_avail}MB of ${mem_total}MB (MemFree alone is misleading here: most of RAM is page cache)"
-# zswap refault: how much of what was compressed out had to be pulled straight back. High is a
-# sign the pool is under-sized for the working set, which is a capacity fact, not a bug.
-if [ -r /proc/vmstat ]; then
-  zrf=$(awk '/^zswpout /{o=$2} /^zswpin /{i=$2} END{ if(o>0) printf "%d", 100*i/o }' /proc/vmstat 2>/dev/null)
-  [ -n "$zrf" ] && note "zswap refault: ${zrf}% of writeouts were read back"
-fi
 # conntrack: ~90 containers plus a torrent client is the workload most likely to exhaust this
 # table, and a full table silently drops new connections. Audited at 4426/262144 (2%), so this
 # is headroom reporting, not a known problem.
@@ -328,7 +349,7 @@ sec device-health
 # unsafe_shutdowns is deliberately NOT flagged: the Micron 2200 in this box reports a
 # spuriously high count (a known firmware quirk), so warning on it would be crying wolf.
 if command -v nvme >/dev/null 2>&1 && [ "$(id -u)" -eq 0 ]; then
-  for dev in /dev/nvme0n1 /dev/nvme1n1; do
+  for dev in /dev/nvme[0-9]n[0-9]; do
     [ -e "$dev" ] || continue
     log=$(nvme smart-log "$dev" 2>/dev/null) || continue
     model=$(cat "/sys/block/$(basename "$dev")/device/model" 2>/dev/null | tr -s ' ')
