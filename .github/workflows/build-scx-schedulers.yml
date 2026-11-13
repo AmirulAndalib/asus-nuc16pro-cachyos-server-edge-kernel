@@ -234,8 +234,10 @@ jobs:
 
           ### Control plane
 
-          \`scx_loader\` + \`scxctl\` are built from sched-ext/scx-loader (tag-matched
-          to scx) and shipped with their systemd unit, DBus activation/policy, and
+          \`scx_loader\` + \`scxctl\` are built from sched-ext/scx-loader at release tag
+          \`${SCX_LOADER_TAG}\` (commit \`${SCX_LOADER_COMMIT}\`; the tag matching scx when one
+          exists, otherwise that repo's newest release tag, never its default branch)
+          and shipped with their systemd unit, DBus activation/policy, and
           polkit action, patched to \`/usr/local/bin\`. The updater installs and enables
           \`scx_loader.service\` (default \`scx_flash\` in Server mode); the direct
           \`nuc16pro-scx-server.service\` stays the fallback if scx_loader is absent.

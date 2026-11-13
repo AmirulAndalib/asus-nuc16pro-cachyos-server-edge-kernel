@@ -129,8 +129,26 @@ fi
 
 # ---------------------------------------------------------------- 7. writing style
 hdr "writing style"
-em="$(git ls-files -z '*.md' 2>/dev/null | xargs -0 grep -l $'—' 2>/dev/null || true)"
-if [ -z "$em" ]; then pass "no em dashes in tracked markdown"; else fail "em dashes present in:$em"; fi
+# Every tracked file, not only markdown: the rule covers comments, unit descriptions and
+# workflow text as much as prose. -I skips binaries. The needle is spelled as its UTF-8
+# bytes (U+2014) so this file does not match itself.
+em="$(git ls-files -z 2>/dev/null | xargs -0 grep -Il $'\xe2\x80\x94' 2>/dev/null | tr '\n' ' ' || true)"
+if [ -z "$em" ]; then pass "no em dashes in any tracked file"; else fail "em dashes present in: $em"; fi
+
+# ---------------------------------------------------------------- 7b. documented cmdline
+hdr "README kernel command line matches the updater"
+# The README quotes the full GRUB command line the updater writes. It drifted once already:
+# the updater moved zswap.max_pool_percent from 20 to 30 and the README kept saying 20 for
+# three months, because nothing compared the two.
+want="$(sed -n 's/^GRUB_CMDLINE_ADD="\(.*\)"$/\1/p' scripts/nuc16pro-kernel-updater.sh.in | head -1)"
+if [ -z "$want" ]; then
+  fail "could not read GRUB_CMDLINE_ADD from scripts/nuc16pro-kernel-updater.sh.in"
+elif grep -qF "\`$want\`" README.md; then
+  pass "README quotes the updater's GRUB command line verbatim"
+  detail "$want"
+else
+  fail "README.md does not quote the current GRUB_CMDLINE_ADD: $want"
+fi
 
 # ---------------------------------------------------------------- 8. actions pinned to SHA
 hdr "supply chain"

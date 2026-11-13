@@ -58,10 +58,6 @@ RESULTS="$WORKDIR/results"; mkdir -p "$RESULTS"
 
 SUDO() { if [ "$(id -u)" -eq 0 ]; then "$@"; else sudo -A "$@"; fi; }
 have()  { command -v "$1" >/dev/null 2>&1; }
-w()     { # write $2 into file $1 if it exists and is writable
-  [ -w "$1" ] 2>/dev/null && printf '%s' "$2" | SUDO tee "$1" >/dev/null 2>&1 || \
-  printf '%s' "$2" | SUDO tee "$1" >/dev/null 2>&1 || true
-}
 
 cleanup() {
   echo
@@ -71,7 +67,12 @@ cleanup() {
   verify_servermax || echo "   !! VERIFY FAILED - inspect the box manually"
   rm -rf "$WORKDIR" 2>/dev/null || true
 }
-trap cleanup EXIT INT TERM
+# cleanup runs once, from EXIT. INT and TERM only turn the signal into an exit: with cleanup
+# trapped on them directly, Ctrl-C restored the profile and then the benchmark loop carried
+# on, switching profiles again against a work directory that had just been deleted.
+trap cleanup EXIT
+trap 'exit 130' INT
+trap 'exit 143' TERM
 
 # ------------------------------------------------------------------ stats
 median() { sort -n | awk '{v[NR]=$1} END{if(NR==0){print 0;exit} m=int((NR+1)/2); if(NR%2) print v[m]; else print (v[m]+v[m+1])/2}'; }
@@ -225,14 +226,13 @@ rotate_profiles() {
   local -a a=("$@"); local len=${#a[@]} i
   [ "$len" -eq 0 ] && return 0
   for ((i = 0; i < len; i++)); do printf '%s ' "${a[$(( (i + n) % len ))]}"; done
-  printf '
-'
+  printf '\n'
 }
 
 run_bench() { # run_bench <name> <fn> <higher_better>
   local name="$1" fn="$2" hb="$3"
   echo "-------------------------------------------------------------------"
-  echo "BENCHMARK: $name   (${DUR}s x ${ROUNDS} rounds x 3 profiles)"
+  echo "BENCHMARK: $name   (${DUR}s x ${ROUNDS} rounds; profiles: $PROFILES)"
   for p in $PROFILES; do : > "$RESULTS/$name.$p"; done
 
   # ROTATE the profile order every round. Running a fixed order (always stock, then
@@ -262,10 +262,10 @@ run_bench() { # run_bench <name> <fn> <higher_better>
     awk -v m="$m" -v b="$base_med" -v hb="$hb" -v bp="$BASE_PROFILE" 'BEGIN{
       if(b==0||m==0){print "  (n/a)"; exit}
       d=(m-b)/b*100; if(hb==0) d=-d;
-      printf "  vs servermax: %+.1f%%\n", d }'
+      printf "  vs %s: %+.1f%%\n", bp, d }'
   done
 
-  # verdict for ultimate vs servermax, the only decision this round makes.
+  # verdict for the candidate profile against the base one, the only decision a round makes.
   # Medians/spreads computed in shell, not awk: mawk (Ubuntu default) has no asort().
   local sm um ssp usp
   sm=$(median  < "$RESULTS/$name.$BASE_PROFILE"); um=$(median  < "$RESULTS/$name.$CAND_PROFILE")
@@ -277,8 +277,8 @@ run_bench() { # run_bench <name> <fn> <higher_better>
       printf "  VERDICT %s vs %s: %+.1f%% (noise floor %.1f%%) -> ", cp, bp, d, floor;
       if(ad<np)         printf "NOISE, do not ship\n";
       else if(ad<floor) printf "NOISE (under within-profile spread), do not ship\n";
-      else if(d>0)      printf "ULTIMATE WINS, ship if reproducible\n";
-      else              printf "REGRESSION, keep servermax\n";
+      else if(d>0)      printf "%s WINS, ship if reproducible\n", toupper(cp);
+      else              printf "REGRESSION, keep %s\n", bp;
   }'
   echo
 }

@@ -51,16 +51,24 @@ cargo build --release --locked "${PKG_ARGS[@]}"
 
 msg "building scx_loader + scxctl (sched-ext/scx-loader control plane)"
 # scx_loader is the DBus on-demand scheduler loader; scxctl is its CLI. They live in a
-# separate repo, version-aligned with scx. Build the matching tag; fall back to the
-# default branch if that tag is absent.
+# separate repo with its own release cadence. Build the tag matching scx when it exists,
+# otherwise the newest release tag. It used to fall back to the default branch, which is how
+# the scx v1.1.4 release came to ship a loader built from v1.1.3 plus two unreleased commits:
+# this daemon runs as root on the box, so it gets released code only.
 LOADER_SRC="$WORK/build/scx-loader"
+LOADER_REPO="https://github.com/sched-ext/scx-loader.git"
 rm -rf "$LOADER_SRC"
-if git clone --depth=1 --branch "$SCX_TAG" https://github.com/sched-ext/scx-loader.git "$LOADER_SRC" 2>/dev/null; then
-  echo "scx-loader at tag $SCX_TAG"
-else
-  echo "scx-loader has no $SCX_TAG tag; using default branch"
-  git clone --depth=1 https://github.com/sched-ext/scx-loader.git "$LOADER_SRC"
+LOADER_TAG="$SCX_TAG"
+if ! git ls-remote --exit-code --tags "$LOADER_REPO" "refs/tags/$SCX_TAG" >/dev/null 2>&1; then
+  LOADER_TAG="$(git ls-remote --tags --refs "$LOADER_REPO" 'v[0-9]*' |
+    sed 's#.*refs/tags/##' | grep -E '^v[0-9]+(\.[0-9]+)*$' | sort -V | tail -n1)"
+  if [ -z "$LOADER_TAG" ]; then
+    echo "error: could not resolve a release tag for sched-ext/scx-loader"
+    exit 1
+  fi
+  echo "scx-loader has no $SCX_TAG tag; using its newest release tag $LOADER_TAG"
 fi
+git clone --depth=1 --branch "$LOADER_TAG" "$LOADER_REPO" "$LOADER_SRC"
 LOADER_COMMIT="$(git -C "$LOADER_SRC" rev-parse --short HEAD)"
 ( cd "$LOADER_SRC" && cargo build --release --locked -p scx_loader -p scxctl )
 
@@ -123,6 +131,7 @@ BUILD_DATE_UTC="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
 TARGET="x86_64-unknown-linux-gnu"
 BASE_IMAGE="ubuntu:26.04"
 BINARIES="${SCX_BINARIES[*]} scx_loader scxctl"
+SCX_LOADER_TAG="${LOADER_TAG}"
 SCX_LOADER_COMMIT="${LOADER_COMMIT}"
 MANIFEST
 

@@ -23,6 +23,7 @@ linux-libc-dev_*
 *.claude
 *.claude/
 *.remember/
+.serena/
 # IDEs
 .idea/
 .vscode/

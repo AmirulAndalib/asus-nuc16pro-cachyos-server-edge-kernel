@@ -115,10 +115,40 @@ echo "tarball: $TARBALL_URL"
 echo "patches (${#PATCH_URLS[@]}):"
 printf '  %s\n' "${PATCH_URLS[@]+"${PATCH_URLS[@]}"}"
 
+# The PKGBUILD records a checksum for every source entry, in the same order as source=().
+# Find the tarball's position and take the checksum at that index, so the kernel source is
+# verified against a value published in a different repository from the one serving the
+# download. Fail closed: a tarball that cannot be verified is not built, because what comes
+# out of this script is installed unattended on an internet-exposed machine.
+TARBALL_SUM=""
+TARBALL_SUM_TOOL=""
+for i in "${!SOURCE_ITEMS[@]}"; do
+  # makepkg allows a "name::url" form, so match the bare URL or that suffix.
+  case "${SOURCE_ITEMS[$i]}" in
+    "$TARBALL_URL"|*"::$TARBALL_URL") ;;
+    *) continue ;;
+  esac
+  for algo in b2 sha512 sha256; do
+    sum="$(_pkgbuild_subshell "printf '%s' \"\${${algo}sums[$i]:-}\"" | tr -d $'\n')"
+    if printf '%s' "$sum" | grep -qE '^[0-9a-f]{64,128}$'; then
+      TARBALL_SUM="$sum"
+      TARBALL_SUM_TOOL="${algo}sum"
+      break
+    fi
+  done
+  break
+done
+if [ -z "$TARBALL_SUM" ]; then
+  echo "error: the PKGBUILD carries no usable checksum for $TARBALL_URL - refusing to build an unverified kernel source"
+  exit 1
+fi
+
 msg "downloading kernel source"
 cd "$BUILD"
 TARBALL_FILE="$(basename "$TARBALL_URL" | sed 's/[?#].*//')"
-wget -q --show-progress -O "$TARBALL_FILE" "$TARBALL_URL"
+wget -q --show-progress --tries=3 -O "$TARBALL_FILE" "$TARBALL_URL"
+echo "verifying $TARBALL_FILE against the PKGBUILD ${TARBALL_SUM_TOOL}"
+echo "${TARBALL_SUM}  ${TARBALL_FILE}" | "$TARBALL_SUM_TOOL" --check --strict
 echo "extracting $TARBALL_FILE..."
 tar -xf "$TARBALL_FILE"
 rm -f "$TARBALL_FILE"
@@ -159,7 +189,7 @@ else
   for url in "${PATCH_URLS[@]}"; do
     name="$(basename "$url" | sed 's/[?#].*//')"
     echo "  -> $name"
-    if ! curl -fsSL -o "/tmp/${name}" "$url"; then
+    if ! curl -fsSL --retry 3 --retry-delay 5 -o "/tmp/${name}" "$url"; then
       echo "warn: download failed: $url"; PATCH_FAIL=1; continue
     fi
     if ! patch -p1 --forward --fuzz=3 -r /dev/null < "/tmp/${name}"; then
@@ -230,6 +260,16 @@ _check_eq  CONFIG_HZ                          100
 _check_eq  CONFIG_TRANSPARENT_HUGEPAGE_ALWAYS y
 _check_eq  CONFIG_LTO_CLANG_THIN              y
 
+# -O3 and the v3 baseline are reported, not enforced: a kernel that came out -O2 is slower,
+# not wrong, and must not block a security update from shipping. What they resolved to is
+# read back from the final .config and written into BUILD_MANIFEST, so the release notes
+# state what was actually built instead of what the fragment asked for.
+OPT_LEVEL=O2
+grep -qE '^CONFIG_CC_OPTIMIZE_FOR_PERFORMANCE_O3=y$' .config && OPT_LEVEL=O3
+X86_LEVEL="$(sed -n 's/^CONFIG_X86_64_VERSION=//p' .config)"
+[ "$OPT_LEVEL" = O3 ] || echo "warn: CONFIG_CC_OPTIMIZE_FOR_PERFORMANCE_O3 did not apply, this kernel is -O2"
+[ "${X86_LEVEL:-}" = 3 ] || echo "warn: CONFIG_X86_64_VERSION is '${X86_LEVEL:-unset}', expected 3 (KCFLAGS still passes -march=x86-64-v3)"
+
 _check_ym  CONFIG_TCP_CONG_BBR
 _check_ym  CONFIG_IWLWIFI
 _check_ym  CONFIG_IWLMVM
@@ -247,8 +287,8 @@ _check_ym  CONFIG_CFS_BANDWIDTH
 _check_ym  CONFIG_ZSWAP
 
 # PREEMPT_RT is incompatible with server throughput - fail hard.
-# PREEMPT_BUILD / PREEMPT_DYNAMIC are acceptable: scx_bpfland --server
-# delivers server-optimized scheduling regardless of static preemption model.
+# PREEMPT_BUILD / PREEMPT_DYNAMIC are acceptable: the box boots preempt=lazy and
+# the sched_ext scheduler (scx_flash) makes the placement decisions either way.
 # CachyOS server 7.x uses PREEMPT_BUILD as its base; PREEMPT_NONE_BUILD is
 # not a valid Kconfig symbol in this kernel tree.
 if grep -qE '^CONFIG_PREEMPT_RT=y' .config; then
@@ -258,13 +298,11 @@ if grep -qE '^CONFIG_PREEMPT_RT=y' .config; then
 else
   PREEMPT_STATE="$(grep -E '^CONFIG_PREEMPT' .config | tr '\n' ' ' || echo '(none)')"
   echo "preemption: $PREEMPT_STATE"
-  echo "info: scx_bpfland --server provides server scheduling regardless"
 fi
 
 _warn_ym CONFIG_NET_SCH_FQ
 _warn_ym CONFIG_NF_TABLES
 _warn_ym CONFIG_BRIDGE_NETFILTER
-_warn_ym CONFIG_IOSCHED_ADIOS
 _warn_ym CONFIG_MQ_IOSCHED_ADIOS
 _warn_ym CONFIG_TLS
 _warn_ym CONFIG_XDP_SOCKETS
@@ -291,7 +329,7 @@ _warn_ym CONFIG_NET_SCH_MULTIQ
 if [ "$FAILED" -ne 0 ]; then
   echo "aborting: critical config failure"
   grep -E \
-    'CONFIG_HZ=|CONFIG_PREEMPT|CONFIG_LTO|CONFIG_TRANSPARENT_HUGEPAGE|CONFIG_DRM_XE|CONFIG_DRM_I915|CONFIG_BBR|CONFIG_IWLWIFI|CONFIG_BPF|CONFIG_DEBUG_INFO_BTF|CONFIG_SCHED_CLASS_EXT|CONFIG_ZSWAP|CONFIG_IOSCHED_ADIOS|CONFIG_IGC' \
+    'CONFIG_HZ=|CONFIG_PREEMPT|CONFIG_LTO|CONFIG_CC_OPTIMIZE|CONFIG_X86_64_VERSION|CONFIG_TRANSPARENT_HUGEPAGE|CONFIG_DRM_XE|CONFIG_DRM_I915|CONFIG_BBR|CONFIG_IWLWIFI|CONFIG_BPF|CONFIG_DEBUG_INFO_BTF|CONFIG_SCHED_CLASS_EXT|CONFIG_ZSWAP|CONFIG_MQ_IOSCHED_ADIOS|CONFIG_IGC' \
     .config || true
   exit 1
 fi
@@ -299,7 +337,7 @@ echo "critical config ok"
 
 msg "config summary"
 grep -E \
-  'CONFIG_HZ=|CONFIG_HZ_100|CONFIG_PREEMPT|CONFIG_CC_IS_CLANG|CONFIG_LTO_CLANG_THIN|CONFIG_TRANSPARENT_HUGEPAGE=|CONFIG_TRANSPARENT_HUGEPAGE_ALWAYS|CONFIG_DEFAULT_TCP_CONG|CONFIG_TCP_CONG_BBR=|CONFIG_DRM_XE=|CONFIG_DRM_I915=|CONFIG_IGC=|CONFIG_DRM_ACCEL_IVPU=|CONFIG_IWLWIFI=|CONFIG_IWLMVM=|CONFIG_IWLMEI=|CONFIG_NET_SCH_FQ=|CONFIG_LOCALVERSION|CONFIG_OVERLAY_FS=|CONFIG_VETH=|CONFIG_BRIDGE=|CONFIG_BPF=|CONFIG_BPF_JIT=|CONFIG_DEBUG_INFO_BTF=|CONFIG_SCHED_CLASS_EXT=|CONFIG_ZSWAP=|CONFIG_IOSCHED_ADIOS=|CONFIG_RCU_LAZY=|CONFIG_INTEL_UNCORE_FREQ_CONTROL=' \
+  'CONFIG_HZ=|CONFIG_HZ_100|CONFIG_PREEMPT|CONFIG_CC_IS_CLANG|CONFIG_CC_OPTIMIZE_FOR_PERFORMANCE|CONFIG_X86_64_VERSION=|CONFIG_LTO_CLANG_THIN|CONFIG_TRANSPARENT_HUGEPAGE=|CONFIG_TRANSPARENT_HUGEPAGE_ALWAYS|CONFIG_DEFAULT_TCP_CONG|CONFIG_TCP_CONG_BBR=|CONFIG_DRM_XE=|CONFIG_DRM_I915=|CONFIG_IGC=|CONFIG_DRM_ACCEL_IVPU=|CONFIG_IWLWIFI=|CONFIG_IWLMVM=|CONFIG_IWLMEI=|CONFIG_NET_SCH_FQ=|CONFIG_LOCALVERSION|CONFIG_OVERLAY_FS=|CONFIG_VETH=|CONFIG_BRIDGE=|CONFIG_BPF=|CONFIG_BPF_JIT=|CONFIG_DEBUG_INFO_BTF=|CONFIG_SCHED_CLASS_EXT=|CONFIG_ZSWAP=|CONFIG_IOSCHED_ADIOS=|CONFIG_RCU_LAZY=|CONFIG_INTEL_UNCORE_FREQ_CONTROL=' \
   .config || true
 
 msg "build"
@@ -346,14 +384,15 @@ CACHY_COMMIT=${CACHY_COMMIT}
 CACHY_VARIANT=${CACHY_VARIANT}
 BUILD_DATE_UTC=$(date -u +%Y-%m-%dT%H:%M:%SZ)
 KERNEL_LOCALVERSION=-cachyos-edge-nuc16pro-servermax
-SCHEDULER=eevdf-servermax
-SCHED_EXT=compiled-in-scx_bpfland-server-auto-enabled
+SCHEDULER=eevdf-base
+SCHED_EXT=compiled-in-schedulers-loaded-from-userspace
 CPU_TARGET=x86-64-v3
+OPT_LEVEL=${OPT_LEVEL}
 TIMER_HZ=100
 LTO=ThinLTO
 THP=always
 PREEMPT=preempt_dynamic-boot_lazy
-ZSWAP=zstd-zsmalloc-20pct
+ZSWAP=zstd-zsmalloc-default-on
 IO_SCHEDULER=adios-best-effort
 CPU_POLICY=powersave-governor-hwp-epp-performance
 IO_URING=enabled
@@ -365,10 +404,10 @@ RCU_LAZY=disabled
 BASE=cachyos-server
 GPU_DRIVER=xe-pantherlake-xe3lp
 ETH_DRIVER=igc-i226v-2500mbps
-NPU=ivpu-pantherlake-50tops
+NPU=ivpu-pantherlake
 WIFI=iwlwifi-be211-wifi7
 POWER_LIMITS=bios-owned-mtp80w-cap
-PLATFORM_PROFILE=bios-owned
+PLATFORM_PROFILE=set-by-updater
 USB_AUTOSUSPEND=disabled
 MANIFEST
 

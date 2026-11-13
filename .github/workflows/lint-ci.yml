@@ -20,21 +20,14 @@ run-name: >-
     && format('PR #{0}', github.event.number)
     || github.ref_name }})
 
+# No path filter. The repo audit greps every tracked file for host data and style, and the
+# generated-updater check depends on systemd/, sysctl.d/, udev/ and modprobe.d/, so a filter
+# listing only workflows and scripts let changes to those directories land unchecked. Every
+# job here finishes in a couple of minutes, which is cheaper than a filter that goes stale.
 on:
   push:
-    paths:
-      - '.github/workflows/**'
-      - '.github/actionlint.yaml'
-      - 'scripts/**'
-      - '**/*.md'
-      - 'netplan/**'
-  pull_request:
-    paths:
-      - '.github/workflows/**'
-      - '.github/actionlint.yaml'
-      - 'scripts/**'
-      - '**/*.md'
-      - 'netplan/**'
+    branches: [master]
+  pull_request: {}
   workflow_dispatch: {}
 
 permissions: {}
@@ -53,7 +46,7 @@ env:
   # checksums file. Bump both together or the verification step fails loudly, which is the
   # intent: a version bump should be a deliberate, verified change.
   ACTIONLINT_SHA256: '8aca8db96f1b94770f1b0d72b6dddcb1ebb8123cb3712530b08cc387b349a3d8'
-  ZIZMOR_VERSION: '1.30.1'
+  ZIZMOR_VERSION: '1.32.0'
 
 jobs:
   actionlint:

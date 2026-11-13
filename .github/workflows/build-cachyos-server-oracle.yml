@@ -99,17 +99,19 @@ jobs:
           git clone --depth=1 --quiet \
             https://github.com/CachyOS/linux-cachyos.git "$CACHY_TMPDIR"
 
-          VARIANT="linux-cachyos-server"
-          if [ ! -d "$CACHY_TMPDIR/$VARIANT" ]; then
-            VARIANT="linux-cachyos"
+          # Read the two fields that compose pkgver; do not source the PKGBUILD here. This
+          # step holds a token that can publish releases, and sourcing would execute
+          # third-party shell right beside it. The container build does source it, with no
+          # token in reach. Same parse as version-drift-check.yml, so all three agree.
+          PKGBUILD="$CACHY_TMPDIR/linux-cachyos-server/PKGBUILD"
+          KVER=""
+          if [ -f "$PKGBUILD" ]; then
+            CACHY_MAJOR="$(sed -n 's/^_major=[\"'\'']*\([0-9.]*\).*/\1/p' "$PKGBUILD" | head -1)"
+            CACHY_MINOR="$(sed -n 's/^_minor=[\"'\'']*\([0-9]*\).*/\1/p' "$PKGBUILD" | head -1)"
+            if [ -n "$CACHY_MAJOR" ]; then
+              KVER="${CACHY_MAJOR}.${CACHY_MINOR:-0}"
+            fi
           fi
-
-          KVER="$(bash -c "
-            cd '$CACHY_TMPDIR/$VARIANT'
-            prepare(){ true; }; build(){ true; }; package(){ true; }
-            source PKGBUILD 2>/dev/null || true
-            printf '%s' \"\${pkgver:-}\"
-          " 2>/dev/null | tr -d $'\n')"
 
           CACHY_COMMIT="$(git -C "$CACHY_TMPDIR" rev-parse --short HEAD || true)"
           rm -rf "$CACHY_TMPDIR"
@@ -285,6 +287,13 @@ jobs:
             dpkg --info "$deb" >/dev/null
           done
 
+          # Ship the updater with the release so installed copies can refresh themselves.
+          # Deliberately NOT listed in SHA256SUMS: updaters already in the field download
+          # only the packages and then run `sha256sum -c SHA256SUMS`, so a listed file they
+          # never fetched would fail that check and block their kernel install.
+          cp scripts/nuc16pro-kernel-updater.sh dist/nuc16pro-kernel-updater.sh
+          ( cd dist && sha256sum nuc16pro-kernel-updater.sh > nuc16pro-kernel-updater.sh.sha256 )
+
           {
             echo "## Built packages"
             echo '```'
@@ -399,6 +408,7 @@ jobs:
           - sched_ext support: \`${SCHED_EXT}\`
           - Compiler: LLVM / Clang \`${CLANG_VERSION}\` + LLD \`${LLD_VERSION}\`
           - LTO: \`${LTO}\`
+          - Optimisation level: \`-${OPT_LEVEL}\`
           - CPU target: \`${CPU_TARGET}\`
           - Timer frequency: \`${TIMER_HZ} Hz\`
           - Preemption model: \`${PREEMPT}\`
@@ -414,7 +424,7 @@ jobs:
           - ACPI platform_profile: \`performance\` (firmware DPTF power slider to max)
           - sched_ext: \`scx_flash\` primary (EDF, latency-weighted); fallback \`scx_bpfland\` -> \`scx_p2dq\` -> \`scx_rusty\` -> \`scx_beerland\` -> \`scx_lavd\`. sched_ext itself is compiled in (\`CONFIG_SCHED_CLASS_EXT=y\`); the schedulers are BPF programs loaded from userspace by \`scx_loader\`, so the kernel does not bake one in.
           - GPU: \`xe\` (Intel Xe3-LP Panther Lake, GuC/HuC auto-enabled); VA-API AV1 / HEVC / H.264 / VP9 encode + decode
-          - zswap: \`zstd\` / \`zsmalloc\` / \`30%\` (z3fold removed upstream). Raised from 20% after measuring 12.77M writeouts against 7.88M readins: the pool was too small to hold the working set, so pages were pushed out and pulled straight back off the encrypted root.
+          - zswap: \`zstd\` / \`zsmalloc\` / \`30%\` pool ceiling, shrinker off. Measured on this hardware: with the shrinker on, every disk swap-out was zswap writeback (20GB in 11.6h) while the pool sat at 1.5% of RAM; with it off, writeback stopped.
           - I/O scheduler: \`adios\`; io_uring / XDP sockets / TLS offload enabled
           - THP: \`always\`, **plus multi-size THP (mTHP) orders 16k/32k/64k enabled**. Measured on this hardware: with only the 2MB PMD order available, 81% of THP faults fell back to 4k pages; enabling the mid orders took per-order success to 93-97%.
           - dm-crypt: \`no_read_workqueue\` + \`no_write_workqueue\` on every LUKS device. With hardware AES (VAES/AVX2) the encryption is cheaper than the workqueue round-trip it replaces.
@@ -438,6 +448,7 @@ jobs:
 
           gh release create "$TAG" \
             dist/*.deb dist/SHA256SUMS dist/BUILD_MANIFEST \
+            dist/nuc16pro-kernel-updater.sh dist/nuc16pro-kernel-updater.sh.sha256 \
             --title "$TITLE" \
             "${PRERELEASE_OPTS[@]}" \
             --notes-file /tmp/release-notes.md
@@ -472,4 +483,6 @@ jobs:
         if: steps.preflight.outputs.skip != 'true'
         uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8  # v4.2.2
         with:
-          subject-path: 'dist/*.deb'
+          subject-path: |
+            dist/*.deb
+            dist/nuc16pro-kernel-updater.sh
